@@ -38,4 +38,4 @@ MESSAGES = {
 
 def get_message(lang_code: str | None, key: str) -> str:
     lang = "ru" if lang_code and lang_code.startswith("ru") else "uz"
-    return MESSAGES[lang][key]
+    return MESSAGES[lang].get(key, MESSAGES["uz"].get(key, key))
