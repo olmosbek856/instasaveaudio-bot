@@ -60,6 +60,41 @@ async def start_handler(message: Message) -> None:
     await message.answer(get_message(_lang(message.from_user), "start"))
 
 
+@dp.message(F.text)
+async def url_handler(message: Message) -> None:
+    url = message.text.strip()
+
+    if not is_instagram_url(url):
+        await message.answer(get_message(_lang(message.from_user), "invalid_url"))
+        return
+
+    status_msg = await message.answer(get_message(_lang(message.from_user), "downloading"))
+
+    file_paths: list[str] = []
+    try:
+        file_paths = await download_media(url)
+
+        audio_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=get_message(_lang(message.from_user), "audio_btn"),
+                callback_data=f"audio:{url}",
+            )
+        ]])
+
+        for i, file_path in enumerate(file_paths):
+            kb = audio_keyboard if i == 0 else None
+            caption = get_message(_lang(message.from_user), "done_video") if i == 0 else ""
+            await _send_media(message, file_path, caption=caption, reply_markup=kb)
+
+    except Exception as exc:
+        logging.error("Download failed for %s: %s", url, exc)
+        await message.answer(get_message(_lang(message.from_user), "error"))
+    finally:
+        await status_msg.delete()
+        if file_paths:
+            cleanup(file_paths[0])
+
+
 async def main() -> None:
     os.makedirs(TEMP_DIR, exist_ok=True)
     await dp.start_polling(bot)
