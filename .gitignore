@@ -1,3 +1,4 @@
+.worktrees/
 .env
 temp/
 __pycache__/
