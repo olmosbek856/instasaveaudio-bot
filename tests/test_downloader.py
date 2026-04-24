@@ -1,7 +1,7 @@
 import os
 import pytest
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from downloader import is_instagram_url, detect_content_type
 
 
@@ -79,9 +79,6 @@ async def test_download_media_returns_file_list(tmp_path):
     fake_file = tmp_path / "000_video.mp4"
     fake_file.write_text("fake video")
 
-    def fake_download(self_ydl, urls):
-        pass  # yt-dlp does nothing
-
     with patch("yt_dlp.YoutubeDL") as MockYDL:
         instance = MockYDL.return_value.__enter__.return_value
         instance.download.side_effect = lambda urls: fake_file.write_text("content")
@@ -96,6 +93,6 @@ async def test_download_media_returns_file_list(tmp_path):
             with patch.object(Path, "iterdir", return_value=iter([fake_file])):
                 result = await downloader.download_media("https://www.instagram.com/reel/ABC/")
             assert isinstance(result, list)
-            assert len(result) >= 0  # May be empty if mock doesn't create files
+            assert len(result) == 1
         finally:
             downloader.TEMP_DIR = original_temp

@@ -8,9 +8,7 @@ from typing import Literal
 
 import yt_dlp
 
-from config import TEMP_DIR, MAX_FILE_SIZE_BYTES
-
-# os, uuid, asyncio, shutil, Path, yt_dlp, TEMP_DIR, MAX_FILE_SIZE_BYTES used by download functions added in Task 4
+from config import TEMP_DIR
 
 _INSTAGRAM_PATTERN = re.compile(
     r"https?://(www\.)?instagram\.com/(p|reel|tv|stories)/[\w\-/]+",
@@ -42,7 +40,7 @@ async def download_media(url: str) -> list[str]:
         "ignoreerrors": True,
     }
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _download() -> None:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -75,7 +73,7 @@ async def download_audio(url: str) -> str:
         "playlist_items": "1",
     }
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _download() -> None:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
