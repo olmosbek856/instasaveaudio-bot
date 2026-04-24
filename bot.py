@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import uuid
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -28,6 +29,8 @@ if not BOT_TOKEN:
 
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
+
+_url_cache: dict[str, str] = {}
 
 
 def _lang(user: User) -> str:
@@ -63,32 +66,36 @@ async def start_handler(message: Message) -> None:
 @dp.message(F.text)
 async def url_handler(message: Message) -> None:
     url = message.text.strip()
+    lang = _lang(message.from_user)
 
     if not is_instagram_url(url):
-        await message.answer(get_message(_lang(message.from_user), "invalid_url"))
+        await message.answer(get_message(lang, "invalid_url"))
         return
 
-    status_msg = await message.answer(get_message(_lang(message.from_user), "downloading"))
+    status_msg = await message.answer(get_message(lang, "downloading"))
 
     file_paths: list[str] = []
     try:
         file_paths = await download_media(url)
 
+        url_key = str(uuid.uuid4())[:8]
+        _url_cache[url_key] = url
+
         audio_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
-                text=get_message(_lang(message.from_user), "audio_btn"),
-                callback_data=f"audio:{url}",
+                text=get_message(lang, "audio_btn"),
+                callback_data=f"audio:{url_key}",
             )
         ]])
 
         for i, file_path in enumerate(file_paths):
             kb = audio_keyboard if i == 0 else None
-            caption = get_message(_lang(message.from_user), "done_video") if i == 0 else ""
+            caption = get_message(lang, "done_video") if i == 0 else ""
             await _send_media(message, file_path, caption=caption, reply_markup=kb)
 
     except Exception as exc:
         logging.error("Download failed for %s: %s", url, exc)
-        await message.answer(get_message(_lang(message.from_user), "error"))
+        await message.answer(get_message(lang, "error"))
     finally:
         await status_msg.delete()
         if file_paths:
