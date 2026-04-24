@@ -78,7 +78,7 @@ async def url_handler(message: Message) -> None:
     try:
         file_paths = await download_media(url)
 
-        url_key = str(uuid.uuid4())[:8]
+        url_key = uuid.uuid4().hex
         _url_cache[url_key] = url
 
         audio_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
@@ -105,9 +105,13 @@ async def url_handler(message: Message) -> None:
 @dp.callback_query(F.data.startswith("audio:"))
 async def audio_callback(callback: CallbackQuery) -> None:
     url_key = callback.data[len("audio:"):]
-    url = _url_cache.get(url_key, "")
+    url = _url_cache.pop(url_key, "")
     if not url:
-        await callback.answer("Havola eskirgan. Qaytadan yuboring.")
+        await callback.answer(get_message(_lang(callback.from_user), "stale_url"))
+        return
+
+    if not callback.message:
+        await callback.answer("Error: no message context.")
         return
 
     user_lang = _lang(callback.from_user)

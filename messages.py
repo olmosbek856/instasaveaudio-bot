@@ -15,6 +15,7 @@ MESSAGES = {
         ),
         "too_large": "😔 Fayl hajmi juda katta (50MB dan oshadi). Telegram cheklovi.",
         "audio_btn": "🎵 Audiosi",
+        "stale_url": "Havola eskirgan. Qaytadan yuboring.",
     },
     "ru": {
         "start": (
@@ -32,6 +33,7 @@ MESSAGES = {
         ),
         "too_large": "😔 Файл слишком большой (больше 50MB). Ограничение Telegram.",
         "audio_btn": "🎵 Аудио",
+        "stale_url": "Ссылка устарела. Отправьте заново.",
     },
 }
 
