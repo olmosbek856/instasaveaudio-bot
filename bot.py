@@ -11,6 +11,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    User,
 )
 
 from config import BOT_TOKEN, MAX_FILE_SIZE_BYTES, TEMP_DIR
@@ -22,11 +23,14 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set. Copy .env.example to .env and fill in your token.")
+
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
 
-def _lang(user) -> str:
+def _lang(user: User) -> str:
     return user.language_code or "uz"
 
 
