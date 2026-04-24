@@ -30,11 +30,12 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
+_URL_CACHE_MAX = 500
 _url_cache: dict[str, str] = {}
 
 
-def _lang(user: User) -> str:
-    return user.language_code or "uz"
+def _lang(user: User | None) -> str:
+    return (user.language_code or "uz") if user else "uz"
 
 
 async def _send_media(
@@ -79,6 +80,8 @@ async def url_handler(message: Message) -> None:
         file_paths = await download_media(url)
 
         url_key = uuid.uuid4().hex
+        if len(_url_cache) >= _URL_CACHE_MAX:
+            _url_cache.pop(next(iter(_url_cache)))
         _url_cache[url_key] = url
 
         audio_keyboard = InlineKeyboardMarkup(inline_keyboard=[[

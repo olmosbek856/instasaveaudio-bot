@@ -70,6 +70,7 @@ async def download_audio(url: str) -> str:
         }],
         "quiet": True,
         "no_warnings": True,
+        "ignoreerrors": True,
         "playlist_items": "1",
     }
 
