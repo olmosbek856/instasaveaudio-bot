@@ -106,12 +106,11 @@ async def url_handler(message: Message) -> None:
 async def audio_callback(callback: CallbackQuery) -> None:
     url_key = callback.data[len("audio:"):]
     url = _url_cache.get(url_key, "")
-    user_lang = _lang(callback.from_user)
-
     if not url:
         await callback.answer("Havola eskirgan. Qaytadan yuboring.")
         return
 
+    user_lang = _lang(callback.from_user)
     await callback.answer()
 
     status_msg = await callback.message.answer(get_message(user_lang, "downloading"))
