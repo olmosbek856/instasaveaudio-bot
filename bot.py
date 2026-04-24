@@ -102,6 +102,37 @@ async def url_handler(message: Message) -> None:
             cleanup(file_paths[0])
 
 
+@dp.callback_query(F.data.startswith("audio:"))
+async def audio_callback(callback: CallbackQuery) -> None:
+    url_key = callback.data[len("audio:"):]
+    url = _url_cache.get(url_key, "")
+    user_lang = _lang(callback.from_user)
+
+    if not url:
+        await callback.answer("Havola eskirgan. Qaytadan yuboring.")
+        return
+
+    await callback.answer()
+
+    status_msg = await callback.message.answer(get_message(user_lang, "downloading"))
+
+    file_path: str | None = None
+    try:
+        file_path = await download_audio(url)
+        audio_file = FSInputFile(file_path)
+        await callback.message.answer_audio(
+            audio=audio_file,
+            caption=get_message(user_lang, "done_audio"),
+        )
+    except Exception as exc:
+        logging.error("Audio download failed for %s: %s", url, exc)
+        await callback.message.answer(get_message(user_lang, "error"))
+    finally:
+        await status_msg.delete()
+        if file_path:
+            cleanup(file_path)
+
+
 async def main() -> None:
     os.makedirs(TEMP_DIR, exist_ok=True)
     await dp.start_polling(bot)
