@@ -352,6 +352,11 @@ async def main() -> None:
     os.makedirs(TEMP_DIR, exist_ok=True)
     if not shutil.which("ffmpeg"):
         logging.warning("ffmpeg not found — audio download will fail")
+    _cookies = os.path.join(os.path.dirname(__file__), "cookies.txt")
+    if os.path.isfile(_cookies):
+        logging.info("cookies.txt found — Instagram requests will use authenticated session")
+    else:
+        logging.warning("cookies.txt not found — Instagram may rate-limit anonymous requests")
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _get_instaloader)
     await dp.start_polling(bot)
