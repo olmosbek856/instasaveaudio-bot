@@ -23,8 +23,24 @@ def test_tv_url_is_valid():
     assert is_instagram_url("https://www.instagram.com/tv/ABC123/") is True
 
 
-def test_non_instagram_url_is_invalid():
-    assert is_instagram_url("https://www.youtube.com/watch?v=abc") is False
+def test_youtube_url_is_valid():
+    assert is_instagram_url("https://www.youtube.com/watch?v=abc123") is True
+
+
+def test_youtube_shorts_url_is_valid():
+    assert is_instagram_url("https://www.youtube.com/shorts/abc123") is True
+
+
+def test_youtu_be_url_is_valid():
+    assert is_instagram_url("https://youtu.be/abc123") is True
+
+
+def test_tiktok_url_is_valid():
+    assert is_instagram_url("https://www.tiktok.com/@user/video/123") is True
+
+
+def test_tiktok_vm_url_is_valid():
+    assert is_instagram_url("https://vm.tiktok.com/ZMrABC123/") is True
 
 
 def test_random_text_is_invalid():
@@ -35,22 +51,38 @@ def test_empty_string_is_invalid():
     assert is_instagram_url("") is False
 
 
+def test_google_url_is_invalid():
+    assert is_instagram_url("https://www.google.com/search?q=cats") is False
+
+
 # --- detect_content_type ---
 
 def test_story_url_returns_story():
     assert detect_content_type("https://www.instagram.com/stories/username/12345/") == "story"
 
 
-def test_reel_url_returns_video():
-    assert detect_content_type("https://www.instagram.com/reel/ABC123/") == "video"
+def test_reel_url_returns_reel():
+    assert detect_content_type("https://www.instagram.com/reel/ABC123/") == "reel"
 
 
-def test_post_url_returns_video():
-    assert detect_content_type("https://www.instagram.com/p/ABC123/") == "video"
+def test_post_url_returns_post():
+    assert detect_content_type("https://www.instagram.com/p/ABC123/") == "post"
 
 
-def test_tv_url_returns_video():
-    assert detect_content_type("https://www.instagram.com/tv/ABC123/") == "video"
+def test_tv_url_returns_post():
+    assert detect_content_type("https://www.instagram.com/tv/ABC123/") == "post"
+
+
+def test_youtube_url_returns_youtube():
+    assert detect_content_type("https://www.youtube.com/watch?v=abc123") == "youtube"
+
+
+def test_youtu_be_url_returns_youtube():
+    assert detect_content_type("https://youtu.be/abc123") == "youtube"
+
+
+def test_tiktok_url_returns_tiktok():
+    assert detect_content_type("https://www.tiktok.com/@user/video/123") == "tiktok"
 
 
 # --- cleanup ---
@@ -83,7 +115,6 @@ async def test_download_media_returns_file_list(tmp_path):
         instance = MockYDL.return_value.__enter__.return_value
         instance.download.side_effect = lambda urls: fake_file.write_text("content")
 
-        # We override TEMP_DIR to use tmp_path for this test
         import downloader
         original_temp = downloader.TEMP_DIR
         downloader.TEMP_DIR = str(tmp_path / "temp")

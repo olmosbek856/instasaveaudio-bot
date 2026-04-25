@@ -4,3 +4,5 @@ temp/
 __pycache__/
 *.pyc
 .pytest_cache/
+cookies.txt
+user_langs.json
