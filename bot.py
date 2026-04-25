@@ -32,6 +32,7 @@ from downloader import (
     cleanup,
     detect_content_type,
     download_audio,
+    download_cdn_url,
     download_media,
     extract_direct_urls,
     extract_info_full,
@@ -166,7 +167,14 @@ async def _send_video_content(
                         await message.answer_video(video=cdn_url, caption=caption, reply_markup=reply_markup)
                     return
                 except TelegramBadRequest:
-                    pass  # Telegram can't fetch Instagram CDN — fall through to disk download
+                    # Telegram can't fetch Instagram CDN — download directly via aiohttp
+                    try:
+                        fp = await download_cdn_url(cdn_url, ext)
+                        file_paths = [fp]
+                        await _send_media(message, fp, lang_code=user_lang, caption=caption, reply_markup=reply_markup)
+                        return
+                    except Exception:
+                        pass  # Last resort: full yt-dlp re-download
             else:
                 try:
                     media_list = []
@@ -182,7 +190,27 @@ async def _send_video_content(
                         await message.answer(caption, reply_markup=reply_markup)
                     return
                 except TelegramBadRequest:
-                    pass  # Fall through to disk download
+                    # Download each CDN URL directly via aiohttp
+                    try:
+                        fps = []
+                        for cdn_u, cdn_e in cdn_items:
+                            fps.append(await download_cdn_url(cdn_u, cdn_e))
+                        file_paths = fps
+                        media_list = []
+                        for i, fp in enumerate(fps):
+                            e = Path(fp).suffix.lower().lstrip(".")
+                            cap = caption if i == 0 else ""
+                            f = FSInputFile(fp)
+                            if e in ("jpg", "jpeg", "png", "webp"):
+                                media_list.append(InputMediaPhoto(media=f, caption=cap))
+                            else:
+                                media_list.append(InputMediaVideo(media=f, caption=cap))
+                        await message.answer_media_group(media=media_list)
+                        if reply_markup:
+                            await message.answer(caption, reply_markup=reply_markup)
+                        return
+                    except Exception:
+                        pass  # Last resort: full yt-dlp re-download
 
         file_paths = await download_media(url)
         if len(file_paths) == 1:

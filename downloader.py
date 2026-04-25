@@ -393,6 +393,31 @@ async def download_audio(url: str) -> str:
         return str(files[0])
 
 
+async def download_cdn_url(cdn_url: str, ext: str) -> str:
+    """Stream-download a direct CDN URL to a temp file via aiohttp (no yt-dlp re-extraction)."""
+    import aiohttp
+    async with _get_download_sem():
+        output_dir = os.path.join(TEMP_DIR, str(uuid.uuid4()))
+        os.makedirs(output_dir, exist_ok=True)
+        file_path = os.path.join(output_dir, f"media.{ext or 'mp4'}")
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+        }
+        timeout = aiohttp.ClientTimeout(total=120)
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(cdn_url, timeout=timeout) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"CDN download failed: HTTP {resp.status}")
+                with open(file_path, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(1024 * 1024):
+                        f.write(chunk)
+        return file_path
+
+
 def cleanup(path: str) -> None:
     """Remove the UUID temp directory that contains path."""
     parent = str(Path(path).parent)
