@@ -181,7 +181,10 @@ async def _do_extract_info(url: str) -> tuple[dict, list[tuple[str, str]]]:
             try:
                 future = loop.run_in_executor(None, _instaloader_fetch, shortcode)
                 meta, cdn_items = await asyncio.wait_for(future, timeout=4.0)
-                if cdn_items:
+                # Only use instaloader CDN for image-only posts — Telegram can access image
+                # CDN URLs directly. For video URLs instaloader returns auth-scoped links
+                # that Telegram's servers cannot fetch; yt-dlp returns publicly signed URLs.
+                if cdn_items and all(e in ("jpg", "jpeg", "png", "webp") for _, e in cdn_items):
                     return meta, cdn_items
             except Exception:
                 pass  # timed out or 403 — fall through to yt-dlp
