@@ -12,6 +12,7 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BufferedInputFile,
@@ -158,24 +159,30 @@ async def _send_video_content(
             if len(cdn_items) == 1:
                 cdn_url, ext = cdn_items[0]
                 is_photo = ext in ("jpg", "jpeg", "png", "webp")
-                if is_photo:
-                    await message.answer_photo(photo=cdn_url, caption=caption, reply_markup=reply_markup)
-                else:
-                    await message.answer_video(video=cdn_url, caption=caption, reply_markup=reply_markup)
-                return
-            else:
-                media_list = []
-                for i, (cdn_url, ext) in enumerate(cdn_items):
-                    is_photo = ext in ("jpg", "jpeg", "png", "webp")
-                    cap = caption if i == 0 else ""
+                try:
                     if is_photo:
-                        media_list.append(InputMediaPhoto(media=cdn_url, caption=cap))
+                        await message.answer_photo(photo=cdn_url, caption=caption, reply_markup=reply_markup)
                     else:
-                        media_list.append(InputMediaVideo(media=cdn_url, caption=cap))
-                await message.answer_media_group(media=media_list)
-                if reply_markup:
-                    await message.answer(caption, reply_markup=reply_markup)
-                return
+                        await message.answer_video(video=cdn_url, caption=caption, reply_markup=reply_markup)
+                    return
+                except TelegramBadRequest:
+                    pass  # Telegram can't fetch Instagram CDN — fall through to disk download
+            else:
+                try:
+                    media_list = []
+                    for i, (cdn_url, ext) in enumerate(cdn_items):
+                        is_photo = ext in ("jpg", "jpeg", "png", "webp")
+                        cap = caption if i == 0 else ""
+                        if is_photo:
+                            media_list.append(InputMediaPhoto(media=cdn_url, caption=cap))
+                        else:
+                            media_list.append(InputMediaVideo(media=cdn_url, caption=cap))
+                    await message.answer_media_group(media=media_list)
+                    if reply_markup:
+                        await message.answer(caption, reply_markup=reply_markup)
+                    return
+                except TelegramBadRequest:
+                    pass  # Fall through to disk download
 
         file_paths = await download_media(url)
         if len(file_paths) == 1:
