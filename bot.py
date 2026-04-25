@@ -3,7 +3,10 @@ import html as _html
 import json
 import logging
 import os
+import shutil
+import time
 import uuid
+from collections import defaultdict
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -53,6 +56,18 @@ dp = Dispatcher()
 _URL_CACHE_MAX = 500
 _url_cache: dict[str, str] = {}
 _meta_cache: dict[str, dict] = {}  # url_key → {title, uploader, thumbnail}
+
+_RATE_WINDOW = 30
+_RATE_MAX = 3
+_rate_store: dict[int, list[float]] = defaultdict(list)
+
+def _is_rate_limited(user_id: int) -> bool:
+    now = time.monotonic()
+    _rate_store[user_id] = [t for t in _rate_store[user_id] if now - t < _RATE_WINDOW]
+    if len(_rate_store[user_id]) >= _RATE_MAX:
+        return True
+    _rate_store[user_id].append(now)
+    return False
 
 _LANGS_FILE = os.path.join(os.path.dirname(__file__), "user_langs.json")
 
@@ -276,6 +291,10 @@ async def url_handler(message: Message) -> None:
     url = message.text.strip()
     lang = _lang(message.from_user)
 
+    if message.from_user and _is_rate_limited(message.from_user.id):
+        await message.answer(get_message(lang, "rate_limit"))
+        return
+
     if not is_instagram_url(url):
         await message.answer(get_message(lang, "invalid_url"))
         return
@@ -327,7 +346,12 @@ async def url_handler(message: Message) -> None:
 
 
 async def main() -> None:
+    if os.path.isdir(TEMP_DIR):
+        for entry in Path(TEMP_DIR).iterdir():
+            shutil.rmtree(entry, ignore_errors=True)
     os.makedirs(TEMP_DIR, exist_ok=True)
+    if not shutil.which("ffmpeg"):
+        logging.warning("ffmpeg not found — audio download will fail")
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _get_instaloader)
     await dp.start_polling(bot)
