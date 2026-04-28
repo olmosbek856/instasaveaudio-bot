@@ -1,0 +1,15 @@
+services:
+  bot:
+    build: .
+    container_name: instasavebot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./cookies.txt:/app/cookies.txt:ro
+      - ./user_langs.json:/app/user_langs.json
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

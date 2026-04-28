@@ -36,9 +36,12 @@ from downloader import (
     download_media,
     extract_direct_urls,
     extract_info_full,
-    is_instagram_url,
+    fetch_instagram_meta,
+    is_supported_url,
+    search_music,
 )
 from messages import get_message
+import recognizer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,9 +62,23 @@ _URL_CACHE_MAX = 500
 _url_cache: dict[str, str] = {}
 _meta_cache: dict[str, dict] = {}  # url_key → {title, uploader, thumbnail}
 
+# Bot username, populated at startup from get_me(). Used by the
+# "Add to group" button so it works regardless of which token is deployed.
+_BOT_USERNAME: str = "instasaveaudio_bot"  # fallback if get_me() hasn't run
+
+# Music search pagination state
+_SEARCH_CACHE_MAX = 100
+_SEARCH_RESULTS_PER_PAGE = 10
+_SEARCH_TOTAL_LIMIT = 50  # ~5 pages
+_search_cache: dict[str, dict] = {}  # search_id → {query, results, url_keys}
+
 _RATE_WINDOW = 30
 _RATE_MAX = 3
 _rate_store: dict[int, list[float]] = defaultdict(list)
+
+# Heights offered to the user. yt-dlp falls back to "best" when a specific
+# height isn't available, so users always get something even on low-res sources.
+QUALITY_HEIGHTS = (480, 720, 1080, 2160)
 
 def _is_rate_limited(user_id: int) -> bool:
     now = time.monotonic()
@@ -104,19 +121,35 @@ def _lang(user: User | None) -> str:
 
 
 def _lang_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🇺🇿  O'zbekcha", callback_data="lang:uz")],
+        [InlineKeyboardButton(text="🇷🇺  Русский",   callback_data="lang:ru")],
+        [InlineKeyboardButton(text="🇬🇧  English",   callback_data="lang:en")],
+    ])
+
+
+def _start_keyboard(lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🇺🇿 O'zbekcha", callback_data="lang:uz"),
-        InlineKeyboardButton(text="🇷🇺 Русский",   callback_data="lang:ru"),
-        InlineKeyboardButton(text="🇬🇧 English",   callback_data="lang:en"),
+        InlineKeyboardButton(
+            text=get_message(lang, "btn_add_to_group"),
+            url=f"https://t.me/{_BOT_USERNAME}?startgroup",
+        )
     ]])
 
 
-def _start_keyboard() -> InlineKeyboardMarkup:
+def _quality_keyboard(url_key: str, lang: str) -> InlineKeyboardMarkup:
+    btn = lambda key, data: InlineKeyboardButton(text=get_message(lang, key), callback_data=data)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn("btn_quality_480",  f"dl:480:{url_key}"),  btn("btn_quality_720", f"dl:720:{url_key}")],
+        [btn("btn_quality_1080", f"dl:1080:{url_key}"), btn("btn_quality_4k",  f"dl:2160:{url_key}")],
+        [btn("btn_quality_audio", f"dl:audio:{url_key}")],
+    ])
+
+
+def _audio_keyboard(url_key: str, lang: str) -> InlineKeyboardMarkup:
+    """Audio-extraction button shown under a delivered video."""
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
-            text="Guruhga qo'shish ⚡",
-            url="https://t.me/insta_reelsave_bot?startgroup=true",
-        )
+        InlineKeyboardButton(text=get_message(lang, "btn_audio"), callback_data=f"fa:{url_key}"),
     ]])
 
 
@@ -146,6 +179,7 @@ async def _send_video_content(
     message: Message,
     url: str,
     user_lang: str,
+    height: int | None = None,
     prefetched_cdn: list[tuple[str, str]] | None = None,
     caption: str = "",
     reply_markup: InlineKeyboardMarkup | None = None,
@@ -155,7 +189,11 @@ async def _send_video_content(
         caption = get_message(user_lang, "attribution")
     file_paths: list[str] = []
     try:
-        cdn_items = prefetched_cdn if prefetched_cdn is not None else await extract_direct_urls(url)
+        cdn_items = (
+            prefetched_cdn
+            if prefetched_cdn is not None
+            else await extract_direct_urls(url, height=height)
+        )
         if cdn_items:
             if len(cdn_items) == 1:
                 cdn_url, ext = cdn_items[0]
@@ -212,7 +250,7 @@ async def _send_video_content(
                     except Exception:
                         pass  # Last resort: full yt-dlp re-download
 
-        file_paths = await download_media(url)
+        file_paths = await download_media(url, height=height)
         if len(file_paths) == 1:
             await _send_media(message, file_paths[0], lang_code=user_lang, caption=caption, reply_markup=reply_markup)
         else:
@@ -264,28 +302,15 @@ async def lang_callback(callback: CallbackQuery) -> None:
         await callback.message.delete()
     except Exception:
         pass
-    await callback.message.answer(get_message(chosen, "start"), reply_markup=_start_keyboard())
+    await callback.message.answer(get_message(chosen, "start"), reply_markup=_start_keyboard(chosen))
 
 
 
-@dp.callback_query(F.data.startswith("fa:"))
-async def audio_callback(callback: CallbackQuery) -> None:
-    url_key = callback.data[3:]
-    url = _url_cache.get(url_key, "")
-    if not url:
-        await callback.answer(get_message(_lang(callback.from_user), "stale_url"))
-        return
-
-    if not callback.message:
-        await callback.answer("Error: no message context.")
-        return
-
-    user_lang = _lang(callback.from_user)
-    await callback.answer()
-
+async def _deliver_audio(callback: CallbackQuery, url_key: str, url: str, user_lang: str) -> None:
+    """Shared audio-extraction path used by both 'fa:' and 'dl:audio:' callbacks."""
     status_msg = await callback.message.answer(get_message(user_lang, "downloading"))
 
-    meta = _meta_cache.pop(url_key, {})
+    meta = _meta_cache.get(url_key, {})
     audio_title = meta.get("title") or ""
     audio_performer = meta.get("uploader") or ""
     thumbnail_url = meta.get("thumbnail") or ""
@@ -316,42 +341,314 @@ async def audio_callback(callback: CallbackQuery) -> None:
         logging.error("Audio download failed for %s: %s", url, exc)
         await callback.message.answer(get_message(user_lang, "error"))
     finally:
-        await status_msg.delete()
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
         if file_path:
             cleanup(file_path)
 
 
+@dp.callback_query(F.data.startswith("fa:"))
+async def audio_callback(callback: CallbackQuery) -> None:
+    """Legacy audio-extraction button shown under a delivered video."""
+    url_key = callback.data[3:]
+    url = _url_cache.get(url_key, "")
+    if not url:
+        await callback.answer(get_message(_lang(callback.from_user), "stale_url"))
+        return
+    if not callback.message:
+        await callback.answer("Error: no message context.")
+        return
+
+    user_lang = _lang(callback.from_user)
+    await callback.answer()
+    await _deliver_audio(callback, url_key, url, user_lang)
+
+
+@dp.callback_query(F.data.startswith("sa:"))
+async def search_audio_callback(callback: CallbackQuery) -> None:
+    """Numeric pick from search results — deliver audio without deleting the picker."""
+    url_key = callback.data[3:]
+    url = _url_cache.get(url_key, "")
+    if not url:
+        await callback.answer(get_message(_lang(callback.from_user), "stale_url"))
+        return
+    if not callback.message:
+        await callback.answer("Error: no message context.")
+        return
+    await callback.answer()
+    await _deliver_audio(callback, url_key, url, _lang(callback.from_user))
+
+
+@dp.callback_query(F.data.startswith("sp:"))
+async def search_page_callback(callback: CallbackQuery) -> None:
+    """Pagination ⬅️/➡️ on a search results message."""
+    payload = callback.data[3:]
+    if payload == "noop":
+        await callback.answer()
+        return
+    parts = payload.split(":", 1)
+    if len(parts) != 2:
+        await callback.answer()
+        return
+    search_id, page_str = parts
+    if search_id not in _search_cache:
+        await callback.answer(get_message(_lang(callback.from_user), "stale_url"))
+        return
+    try:
+        page = int(page_str)
+    except ValueError:
+        await callback.answer()
+        return
+
+    await callback.answer()
+    text, kb = _render_search_page(search_id, page=page, lang=_lang(callback.from_user))
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+    except TelegramBadRequest:
+        pass
+
+
+@dp.callback_query(F.data.startswith("sx:"))
+async def search_close_callback(callback: CallbackQuery) -> None:
+    """❌ — drop the cached search and remove the message."""
+    search_id = callback.data[3:]
+    _search_cache.pop(search_id, None)
+    await callback.answer()
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data.startswith("dl:"))
+async def download_callback(callback: CallbackQuery) -> None:
+    """Quality picker — `dl:{height_or_audio}:{url_key}`."""
+    parts = callback.data.split(":", 2)
+    if len(parts) != 3:
+        await callback.answer()
+        return
+    _, quality, url_key = parts
+
+    url = _url_cache.get(url_key, "")
+    if not url:
+        await callback.answer(get_message(_lang(callback.from_user), "stale_url"))
+        return
+    if not callback.message:
+        await callback.answer("Error: no message context.")
+        return
+
+    user_lang = _lang(callback.from_user)
+    await callback.answer()
+
+    # Delete the picker prompt entirely — the user has chosen, the message has no further use.
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+    if quality == "audio":
+        await _deliver_audio(callback, url_key, url, user_lang)
+        return
+
+    try:
+        height = int(quality)
+    except ValueError:
+        await callback.answer()
+        return
+
+    content_type = detect_content_type(url)
+    status_key = {
+        "reel":      "downloading_reel",
+        "post":      "downloading_post",
+        "story":     "downloading_story",
+        "youtube":   "downloading_youtube",
+        "tiktok":    "downloading_tiktok",
+        "snapchat":  "downloading_snapchat",
+        "likee":     "downloading_likee",
+        "pinterest": "downloading_pinterest",
+        "threads":   "downloading_threads",
+    }.get(content_type, "downloading")
+    status_msg = await callback.message.answer(get_message(user_lang, status_key))
+
+    meta = _meta_cache.get(url_key, {})
+    uploader = meta.get("uploader") or ""
+    attribution = get_message(user_lang, "attribution")
+    caption = f"📹 <b>{_html.escape(uploader)}</b>\n\n{attribution}" if uploader else attribution
+    audio_kb = _audio_keyboard(url_key, user_lang)
+
+    try:
+        await _send_video_content(
+            callback.message, url, user_lang,
+            height=height,
+            prefetched_cdn=None,
+            caption=caption,
+            reply_markup=audio_kb,
+        )
+    except Exception:
+        logging.exception("Quality download failed for %s @ %sp", url, height)
+        await callback.message.answer(get_message(user_lang, "error"))
+    finally:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+
+def _is_url_text(text: str) -> bool:
+    """Cheap pre-check so plain chatter is routed to music search instead of URL flow."""
+    t = text.strip()
+    return t.startswith("http://") or t.startswith("https://")
+
+
+def _format_duration(seconds) -> str:
+    if not seconds:
+        return ""
+    s = int(seconds)
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def _render_search_page(search_id: str, page: int, lang: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Build the message text + inline keyboard for one search-results page."""
+    entry = _search_cache[search_id]
+    query = entry["query"]
+    results = entry["results"]
+    url_keys = entry["url_keys"]
+
+    total_pages = max(1, (len(results) + _SEARCH_RESULTS_PER_PAGE - 1) // _SEARCH_RESULTS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * _SEARCH_RESULTS_PER_PAGE
+    end = start + _SEARCH_RESULTS_PER_PAGE
+    page_results = results[start:end]
+    page_keys = url_keys[start:end]
+
+    lines = [f"🔎 <code>{_html.escape(query)}</code>", ""]
+    for offset, r in enumerate(page_results):
+        global_num = start + offset + 1  # continuous across pages: 1..10, 11..20, ...
+        title = _html.escape((r.get("title") or "").strip())
+        dur = _format_duration(r.get("duration"))
+        lines.append(
+            f"<b>{global_num}.</b> {title} <b>{dur}</b>"
+            if dur
+            else f"<b>{global_num}.</b> {title}"
+        )
+    text = "\n".join(lines)
+
+    # Numeric picker — two rows of five (rounded up to actual count).
+    num_buttons = [
+        InlineKeyboardButton(text=str(i), callback_data=f"sa:{key}")
+        for i, key in enumerate(page_keys, start=1)
+    ]
+    rows: list[list[InlineKeyboardButton]] = []
+    if num_buttons:
+        rows.append(num_buttons[:5])
+        if len(num_buttons) > 5:
+            rows.append(num_buttons[5:10])
+
+    # Pagination row: ⬅️ ❌ ➡️
+    prev_data = f"sp:{search_id}:{page-1}" if page > 0 else "sp:noop"
+    next_data = f"sp:{search_id}:{page+1}" if page < total_pages - 1 else "sp:noop"
+    rows.append([
+        InlineKeyboardButton(text="⬅️", callback_data=prev_data),
+        InlineKeyboardButton(text="❌", callback_data=f"sx:{search_id}"),
+        InlineKeyboardButton(text="➡️", callback_data=next_data),
+    ])
+
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _handle_music_search(message: Message, query: str, lang: str) -> None:
+    """Type a song/artist name → numbered list of YouTube results with paging."""
+    status_msg = await message.answer(get_message(lang, "searching"))
+    try:
+        results = await search_music(query, limit=_SEARCH_TOTAL_LIMIT)
+    except Exception:
+        logging.exception("Music search failed for %r", query)
+        try: await status_msg.delete()
+        except Exception: pass
+        await message.answer(get_message(lang, "search_failed"))
+        return
+
+    try: await status_msg.delete()
+    except Exception: pass
+
+    if not results:
+        await message.answer(get_message(lang, "search_no_results"))
+        return
+
+    # Pre-allocate url_keys for every result so the existing audio-download flow works.
+    url_keys: list[str] = []
+    for r in results:
+        url_key = uuid.uuid4().hex
+        if len(_url_cache) >= _URL_CACHE_MAX:
+            _url_cache.pop(next(iter(_url_cache)))
+        _url_cache[url_key] = r["url"]
+        if len(_meta_cache) >= _URL_CACHE_MAX:
+            _meta_cache.pop(next(iter(_meta_cache)))
+        _meta_cache[url_key] = {
+            "title":     r.get("title", ""),
+            "uploader":  r.get("uploader", ""),
+            "thumbnail": r.get("thumbnail", ""),
+        }
+        url_keys.append(url_key)
+
+    search_id = uuid.uuid4().hex
+    if len(_search_cache) >= _SEARCH_CACHE_MAX:
+        _search_cache.pop(next(iter(_search_cache)))
+    _search_cache[search_id] = {
+        "query": query,
+        "results": results,
+        "url_keys": url_keys,
+    }
+
+    text, kb = _render_search_page(search_id, page=0, lang=lang)
+    await message.answer(text, reply_markup=kb, disable_web_page_preview=True)
+
+
 @dp.message(F.text)
 async def url_handler(message: Message) -> None:
-    url = message.text.strip()
+    text = (message.text or "").strip()
     lang = _lang(message.from_user)
 
     if message.from_user and _is_rate_limited(message.from_user.id):
         await message.answer(get_message(lang, "rate_limit"))
         return
 
-    if not is_instagram_url(url):
+    # Non-URL text → music search (private chat only; groups stay quiet)
+    if not _is_url_text(text):
+        if message.chat.type == "private" and len(text) >= 2:
+            await _handle_music_search(message, text, lang)
+        return
+
+    url = text
+
+    if not is_supported_url(url):
         await message.answer(get_message(lang, "invalid_url"))
         return
 
     content_type = detect_content_type(url)
-    status_key = {
-        "reel":    "downloading_reel",
-        "post":    "downloading_post",
-        "story":   "downloading_story",
-        "youtube": "downloading_youtube",
-        "tiktok":  "downloading_tiktok",
-    }.get(content_type, "downloading")
-
     url_key = uuid.uuid4().hex
     if len(_url_cache) >= _URL_CACHE_MAX:
         _url_cache.pop(next(iter(_url_cache)))
     _url_cache[url_key] = url
 
-    status_msg = await message.answer(get_message(lang, status_key))
-    meta, cdn_items = await extract_info_full(url)
+    status_msg = await message.answer(get_message(lang, "fetching_meta"))
+
+    is_instagram_video = (
+        content_type in ("reel", "story")
+        and "instagram.com" in url.lower()
+    )
 
     try:
+        if is_instagram_video:
+            # IG video: instaloader returns auth-scoped URLs and yt-dlp HLS works fine
+            # at download-time. Skip the CDN extraction and just grab metadata.
+            meta = await fetch_instagram_meta(url)
+            cdn_items: list[tuple[str, str]] = []
+        else:
+            meta, cdn_items = await extract_info_full(url)
+
         uploader = meta.get("uploader") or ""
         attribution = get_message(lang, "attribution")
         caption = f"📹 <b>{_html.escape(uploader)}</b>\n\n{attribution}" if uploader else attribution
@@ -364,34 +661,147 @@ async def url_handler(message: Message) -> None:
             "thumbnail": meta.get("thumbnail") or "",
         }
 
-        is_images_only = bool(cdn_items) and all(ext in ("jpg", "jpeg", "png", "webp") for _, ext in cdn_items)
-        audio_keyboard = None
-        if not is_images_only and content_type != "story":
-            audio_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text=get_message(lang, "btn_audio"), callback_data=f"fa:{url_key}"),
-            ]])
+        is_images_only = bool(cdn_items) and all(
+            ext in ("jpg", "jpeg", "png", "webp") for _, ext in cdn_items
+        )
 
-        await _send_video_content(message, url, lang, prefetched_cdn=cdn_items, caption=caption, reply_markup=audio_keyboard)
-
+        if is_images_only:
+            # Photos have no quality variants worth picking — just send them.
+            await _send_video_content(
+                message, url, lang,
+                prefetched_cdn=cdn_items,
+                caption=caption,
+                reply_markup=None,
+            )
+        else:
+            # Picker shows title only — no "downloaded via" attribution since
+            # nothing has been downloaded yet at this point.
+            picker_text = (
+                f"📹 <b>{_html.escape(uploader)}</b>\n\n{get_message(lang, 'choose_quality')}"
+                if uploader
+                else get_message(lang, "choose_quality")
+            )
+            await message.answer(
+                picker_text,
+                reply_markup=_quality_keyboard(url_key, lang),
+            )
     except Exception:
-        logging.exception("Media fetch failed for %s", url)
+        logging.exception("Media handling failed for %s", url)
         await message.answer(get_message(lang, "error"))
     finally:
-        await status_msg.delete()
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+
+# ── Music recognition (Shazam) ─────────────────────────────────────────────
+
+async def _handle_recognition(message: Message, source_path: str) -> None:
+    user_lang = _lang(message.from_user)
+    status_msg = await message.answer(get_message(user_lang, "recognizing"))
+    workdir = recognizer.make_workdir()
+    try:
+        clip = await recognizer.extract_audio_clip(source_path, workdir)
+        track = await recognizer.recognize(clip)
+        if not track:
+            await message.answer(get_message(user_lang, "not_recognized"))
+            return
+        title = _html.escape(track["title"]) or "?"
+        artist = _html.escape(track["artist"]) or "?"
+        if track.get("url"):
+            text = get_message(user_lang, "recognized").format(
+                title=title, artist=artist, url=track["url"],
+            )
+        else:
+            text = get_message(user_lang, "recognized_no_link").format(
+                title=title, artist=artist,
+            )
+        await message.answer(text, disable_web_page_preview=False)
+    except Exception:
+        logging.exception("Recognition failed for %s", source_path)
+        await message.answer(get_message(user_lang, "not_recognized"))
+    finally:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        recognizer.cleanup(workdir)
+
+
+async def _download_telegram_file(file_id: str, suffix: str) -> str:
+    """Download a Telegram-hosted file into TEMP_DIR and return the local path."""
+    out_dir = os.path.join(TEMP_DIR, f"shazam-src-{uuid.uuid4()}")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"src{suffix}")
+    file = await bot.get_file(file_id)
+    await bot.download_file(file.file_path, destination=out_path)
+    return out_path
+
+
+@dp.message(F.voice)
+async def voice_handler(message: Message) -> None:
+    if message.chat.type != "private":
+        return
+    src = await _download_telegram_file(message.voice.file_id, ".ogg")
+    try:
+        await _handle_recognition(message, src)
+    finally:
+        cleanup(src)
+
+
+@dp.message(F.audio)
+async def audio_handler(message: Message) -> None:
+    if message.chat.type != "private":
+        return
+    suffix = ".mp3"
+    name = message.audio.file_name or ""
+    if name and "." in name:
+        suffix = "." + name.rsplit(".", 1)[1].lower()
+    src = await _download_telegram_file(message.audio.file_id, suffix)
+    try:
+        await _handle_recognition(message, src)
+    finally:
+        cleanup(src)
+
+
+@dp.message(F.video)
+async def video_handler(message: Message) -> None:
+    if message.chat.type != "private":
+        return
+    src = await _download_telegram_file(message.video.file_id, ".mp4")
+    try:
+        await _handle_recognition(message, src)
+    finally:
+        cleanup(src)
+
+
+@dp.message(F.video_note)
+async def video_note_handler(message: Message) -> None:
+    if message.chat.type != "private":
+        return
+    src = await _download_telegram_file(message.video_note.file_id, ".mp4")
+    try:
+        await _handle_recognition(message, src)
+    finally:
+        cleanup(src)
 
 
 async def main() -> None:
+    global _BOT_USERNAME
     if os.path.isdir(TEMP_DIR):
         for entry in Path(TEMP_DIR).iterdir():
             shutil.rmtree(entry, ignore_errors=True)
     os.makedirs(TEMP_DIR, exist_ok=True)
     if not shutil.which("ffmpeg"):
         logging.warning("ffmpeg not found — audio download will fail")
-    _cookies = os.path.join(os.path.dirname(__file__), "cookies.txt")
-    if os.path.isfile(_cookies):
-        logging.info("cookies.txt found — Instagram requests will use authenticated session")
-    else:
-        logging.warning("cookies.txt not found — Instagram may rate-limit anonymous requests")
+    try:
+        me = await bot.get_me()
+        if me.username:
+            _BOT_USERNAME = me.username
+            logging.info("Bot username: @%s", _BOT_USERNAME)
+    except Exception:
+        logging.exception("Failed to fetch bot username via get_me()")
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _get_instaloader)
     await dp.start_polling(bot)
