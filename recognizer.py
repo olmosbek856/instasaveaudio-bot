@@ -9,7 +9,6 @@ from config import TEMP_DIR
 
 _shazam = None
 _shazam_sem: asyncio.Semaphore | None = None
-_shazam_import_error: str | None = None
 
 # Shazam recognises 12s of audio reliably; we trim to 20s as a safety margin.
 _SHAZAM_CLIP_SECONDS = 20
@@ -18,12 +17,11 @@ _RECOGNIZE_TIMEOUT = 25.0
 
 
 def _get_shazam():
-    global _shazam, _shazam_import_error
+    global _shazam
     if _shazam is None:
         try:
             from shazamio import Shazam
         except ImportError as e:
-            _shazam_import_error = str(e)
             logging.error(
                 "shazamio not installed — music recognition disabled. "
                 "Install with: pip install shazamio (Python 3.13 + Windows requires "

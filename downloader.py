@@ -338,27 +338,6 @@ async def fetch_instagram_meta(url: str) -> dict:
         return {}
 
 
-async def extract_metadata(url: str) -> dict:
-    """Return title, uploader, thumbnail without downloading."""
-    ydl_opts = {**_base_opts(), "format": "best"}
-    loop = asyncio.get_running_loop()
-
-    def _extract() -> dict:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-        if not info:
-            return {}
-        entries = info.get("entries")
-        item = entries[0] if entries else info
-        return {
-            "title": item.get("title") or item.get("description") or "",
-            "uploader": item.get("uploader") or item.get("channel") or "",
-            "thumbnail": item.get("thumbnail") or "",
-        }
-
-    return await loop.run_in_executor(None, _extract)
-
-
 def _instaloader_fetch(shortcode: str) -> tuple[dict, list[tuple[str, str]]]:
     """Get CDN URLs and metadata via instaloader (posts, reels, carousels)."""
     import instaloader
