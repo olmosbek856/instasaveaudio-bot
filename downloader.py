@@ -23,6 +23,26 @@ class _SilentLogger:
 
 _COOKIES_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
 
+
+def _cookiefile_for(url: str) -> str | None:
+    """Return cookies.txt path if usable for this URL, else None.
+
+    Instagram blocks most reels/posts/stories anonymously now — passing cookies
+    to yt-dlp is the difference between a 401/403 and a successful extraction.
+    The 50-byte floor filters out an empty placeholder file (just the Netscape
+    header) so yt-dlp doesn't bother with a useless cookie jar.
+    """
+    if not os.path.isfile(_COOKIES_FILE):
+        return None
+    try:
+        if os.path.getsize(_COOKIES_FILE) < 50:
+            return None
+    except OSError:
+        return None
+    if "instagram.com" in url.lower():
+        return _COOKIES_FILE
+    return None
+
 def _base_opts() -> dict:
     opts: dict = {
         "quiet": True,
@@ -266,6 +286,9 @@ async def _do_extract_info(url: str, height: int | None = None) -> tuple[dict, l
 
     fmt = _format_for(content_type, height, url)
     ydl_opts = {**_base_opts(), "format": fmt}
+    cookiefile = _cookiefile_for(url)
+    if cookiefile:
+        ydl_opts["cookiefile"] = cookiefile
 
     def _extract() -> tuple[dict, list[tuple[str, str]]]:
         try:
@@ -381,6 +404,9 @@ async def extract_direct_urls(url: str, height: int | None = None) -> list[tuple
         **_base_opts(),
         "format": fmt,
     }
+    cookiefile = _cookiefile_for(url)
+    if cookiefile:
+        ydl_opts["cookiefile"] = cookiefile
     loop = asyncio.get_running_loop()
 
     def _extract() -> list[tuple[str, str]]:
@@ -446,8 +472,9 @@ async def download_media(url: str, height: int | None = None) -> list[str]:
             "outtmpl": os.path.join(output_dir, "%(autonumber)03d_%(title)s.%(ext)s"),
             "concurrent_fragment_downloads": 20,
         }
-        if content_type == "story" and os.path.isfile(_COOKIES_FILE):
-            ydl_opts["cookiefile"] = _COOKIES_FILE
+        cookiefile = _cookiefile_for(url)
+        if cookiefile:
+            ydl_opts["cookiefile"] = cookiefile
 
         loop = asyncio.get_running_loop()
 
@@ -462,6 +489,46 @@ async def download_media(url: str, height: int | None = None) -> list[str]:
             raise FileNotFoundError("yt-dlp produced no files")
 
         return [str(f) for f in files]
+
+
+async def search_and_download_audio(query: str) -> tuple[str, dict] | None:
+    """Single yt-dlp call: ytsearch + download top match's audio (no MP3 reencode).
+
+    Used by the Shazam-recognition flow where speed matters more than the
+    forced MP3 codec — Telegram plays m4a/aac with proper title/performer
+    metadata just fine, and skipping the FFmpeg conversion saves ~10-20s
+    on a typical 4-minute track.
+    """
+    async with _get_download_sem():
+        output_dir = os.path.join(TEMP_DIR, str(uuid.uuid4()))
+        os.makedirs(output_dir, exist_ok=True)
+        ydl_opts = {
+            **_base_opts(),
+            "format": "bestaudio[ext=m4a]/bestaudio[acodec=aac]/bestaudio",
+            "outtmpl": os.path.join(output_dir, "audio.%(ext)s"),
+            "default_search": "ytsearch",
+            "noplaylist": True,
+            "playlist_items": "1",
+            "concurrent_fragment_downloads": 10,
+        }
+        loop = asyncio.get_running_loop()
+        captured: dict = {}
+
+        def _run() -> None:
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(f"ytsearch1:{query}")
+                if info and info.get("entries"):
+                    captured["info"] = info["entries"][0] or {}
+            except Exception:
+                logging.exception("search_and_download_audio failed for %r", query)
+
+        await loop.run_in_executor(None, _run)
+
+        files = sorted(Path(output_dir).glob("audio.*"))
+        if not files:
+            return None
+        return str(files[0]), captured.get("info", {})
 
 
 async def download_audio(url: str) -> str:

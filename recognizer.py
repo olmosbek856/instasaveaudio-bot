@@ -9,6 +9,7 @@ from config import TEMP_DIR
 
 _shazam = None
 _shazam_sem: asyncio.Semaphore | None = None
+_shazam_import_error: str | None = None
 
 # Shazam recognises 12s of audio reliably; we trim to 20s as a safety margin.
 _SHAZAM_CLIP_SECONDS = 20
@@ -17,9 +18,19 @@ _RECOGNIZE_TIMEOUT = 25.0
 
 
 def _get_shazam():
-    global _shazam
+    global _shazam, _shazam_import_error
     if _shazam is None:
-        from shazamio import Shazam
+        try:
+            from shazamio import Shazam
+        except ImportError as e:
+            _shazam_import_error = str(e)
+            logging.error(
+                "shazamio not installed — music recognition disabled. "
+                "Install with: pip install shazamio (Python 3.13 + Windows requires "
+                "Visual Studio Build Tools for the Rust shazamio-core compile; on Linux "
+                "Docker the prebuilt wheels just work). Original error: %s", e,
+            )
+            raise
         _shazam = Shazam()
     return _shazam
 
@@ -39,17 +50,20 @@ def make_workdir() -> str:
 
 
 async def extract_audio_clip(input_path: str, out_dir: str) -> str:
-    """Trim to first ~20s + downmix to 16kHz mono mp3 — enough for fingerprinting."""
+    """Trim to first ~20s — preserves source quality (no downsample/downmix).
+
+    Earlier we forced 16kHz mono 64kbps which mangled the fingerprint and made
+    Shazam miss recognisable tracks. Now we just trim and re-encode at high
+    VBR quality, keeping stereo and original sample rate.
+    """
     out = os.path.join(out_dir, "clip.mp3")
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg",
         "-i", input_path,
         "-t", str(_SHAZAM_CLIP_SECONDS),
         "-vn",
-        "-ac", "1",
-        "-ar", "16000",
         "-acodec", "libmp3lame",
-        "-ab", "64k",
+        "-q:a", "2",  # high-quality VBR (~190 kbps)
         "-y", out,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
@@ -62,6 +76,8 @@ async def extract_audio_clip(input_path: str, out_dir: str) -> str:
 
 async def recognize(audio_path: str) -> dict | None:
     """Return {title, artist, url, cover, apple} or None when unrecognised."""
+    file_size = os.path.getsize(audio_path) if os.path.isfile(audio_path) else 0
+    logging.info("Shazam: recognising %s (%d bytes)", audio_path, file_size)
     async with _get_sem():
         try:
             result = await asyncio.wait_for(
@@ -69,15 +85,21 @@ async def recognize(audio_path: str) -> dict | None:
                 timeout=_RECOGNIZE_TIMEOUT,
             )
         except asyncio.TimeoutError:
-            logging.warning("Shazam timed out for %s", audio_path)
+            logging.warning("Shazam: timeout for %s", audio_path)
             return None
         except Exception:
-            logging.exception("Shazam recognise failed for %s", audio_path)
+            logging.exception("Shazam: recognise failed for %s", audio_path)
             return None
 
     track = (result or {}).get("track")
     if not track:
+        matches = (result or {}).get("matches") or []
+        logging.info(
+            "Shazam: no track for %s (matches=%d, raw_keys=%s)",
+            audio_path, len(matches), list((result or {}).keys()),
+        )
         return None
+    logging.info("Shazam: matched %r — %r", track.get("title"), track.get("subtitle"))
 
     apple = None
     for action_block in track.get("hub", {}).get("actions", []) or []:

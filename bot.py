@@ -38,6 +38,7 @@ from downloader import (
     extract_info_full,
     fetch_instagram_meta,
     is_supported_url,
+    search_and_download_audio,
     search_music,
 )
 from messages import get_message
@@ -707,17 +708,19 @@ async def _handle_recognition(message: Message, source_path: str) -> None:
         if not track:
             await message.answer(get_message(user_lang, "not_recognized"))
             return
-        title = _html.escape(track["title"]) or "?"
-        artist = _html.escape(track["artist"]) or "?"
-        if track.get("url"):
-            text = get_message(user_lang, "recognized").format(
-                title=title, artist=artist, url=track["url"],
-            )
-        else:
-            text = get_message(user_lang, "recognized_no_link").format(
-                title=title, artist=artist,
-            )
-        await message.answer(text, disable_web_page_preview=False)
+
+        title_raw = track["title"] or ""
+        artist_raw = track["artist"] or ""
+        if not (title_raw and artist_raw):
+            # Shazam returned a partial match we can't search YouTube for cleanly.
+            await message.answer(get_message(user_lang, "not_recognized"))
+            return
+
+        delivered = await _deliver_recognized_song(
+            message, title_raw, artist_raw, user_lang,
+        )
+        if not delivered:
+            await message.answer(get_message(user_lang, "not_recognized"))
     except Exception:
         logging.exception("Recognition failed for %s", source_path)
         await message.answer(get_message(user_lang, "not_recognized"))
@@ -727,6 +730,60 @@ async def _handle_recognition(message: Message, source_path: str) -> None:
         except Exception:
             pass
         recognizer.cleanup(workdir)
+
+
+async def _deliver_recognized_song(
+    message: Message, title: str, artist: str, user_lang: str,
+) -> bool:
+    """After a Shazam match, fetch the full audio from YouTube and send it.
+
+    Uses search_and_download_audio (single yt-dlp call, no MP3 reencode) so
+    delivery is ~3x faster than the explicit-MP3 path. Returns True on
+    successful send so the caller can fall back to 'not recognized' otherwise.
+    """
+    query = f"{artist} {title}"
+    try:
+        await bot.send_chat_action(message.chat.id, "upload_voice")
+    except Exception:
+        pass
+
+    file_path: str | None = None
+    try:
+        result = await search_and_download_audio(query)
+        if not result:
+            logging.info("Recognised-song: nothing found/downloadable for %r", query)
+            return False
+        file_path, info = result
+
+        thumb_input = None
+        thumbnail_url = (info.get("thumbnail") or "") if info else ""
+        if thumbnail_url:
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        thumbnail_url, timeout=aiohttp.ClientTimeout(total=5),
+                    ) as resp:
+                        if resp.status == 200:
+                            thumb_data = await resp.read()
+                            thumb_input = BufferedInputFile(thumb_data, filename="thumb.jpg")
+            except Exception:
+                pass
+
+        await message.answer_audio(
+            audio=FSInputFile(file_path),
+            title=title,
+            performer=artist,
+            thumbnail=thumb_input,
+            caption=get_message(user_lang, "attribution"),
+        )
+        return True
+    except Exception:
+        logging.exception("Recognised-song download failed for %r", query)
+        return False
+    finally:
+        if file_path:
+            cleanup(file_path)
 
 
 async def _download_telegram_file(file_id: str, suffix: str) -> str:
@@ -789,12 +846,39 @@ async def video_note_handler(message: Message) -> None:
 
 async def main() -> None:
     global _BOT_USERNAME
+    # Railway / hosted-deploy path: cookies.txt is a secret, so we read it from
+    # the INSTAGRAM_COOKIES_TXT env var and write it to disk before any
+    # instaloader/yt-dlp call. Local Docker compose users keep using the bind mount.
+    cookies_env = os.getenv("INSTAGRAM_COOKIES_TXT")
+    if cookies_env:
+        cookies_path = os.path.join(os.path.dirname(__file__), "cookies.txt")
+        try:
+            with open(cookies_path, "w", encoding="utf-8") as f:
+                f.write(cookies_env)
+            logging.info("Wrote INSTAGRAM_COOKIES_TXT → %s (%d bytes)", cookies_path, len(cookies_env))
+        except Exception:
+            logging.exception("Failed to write cookies file from INSTAGRAM_COOKIES_TXT")
     if os.path.isdir(TEMP_DIR):
         for entry in Path(TEMP_DIR).iterdir():
             shutil.rmtree(entry, ignore_errors=True)
     os.makedirs(TEMP_DIR, exist_ok=True)
+    cookies_path_check = os.path.join(os.path.dirname(__file__), "cookies.txt")
+    if os.path.isfile(cookies_path_check) and os.path.getsize(cookies_path_check) >= 50:
+        logging.info("cookies.txt present (%d bytes) — Instagram authenticated", os.path.getsize(cookies_path_check))
+    else:
+        logging.warning("cookies.txt missing or empty — Instagram reels/stories will likely fail (set INSTAGRAM_COOKIES_TXT)")
     if not shutil.which("ffmpeg"):
         logging.warning("ffmpeg not found — audio download will fail")
+    try:
+        import shazamio  # noqa: F401
+        logging.info("shazamio available — music recognition enabled")
+    except ImportError as e:
+        logging.warning(
+            "shazamio not installed — music recognition will return 'not recognized' "
+            "for every voice/audio/video. Install with `pip install shazamio` "
+            "(Linux/Docker: works out of the box; Windows + Python 3.13: needs MSVC "
+            "Build Tools for the Rust compile, or use Python 3.11). Detail: %s", e,
+        )
     try:
         me = await bot.get_me()
         if me.username:

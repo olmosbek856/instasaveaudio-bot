@@ -114,6 +114,25 @@ docker compose up -d --build          # qayta build + restart
 
 ---
 
+## Railway.app deploy
+
+Railway Dockerfile orqali build qiladi. `cookies.txt` git'ga commit qilinmagan
+(va qilinmasligi kerak — bu maxfiy fayl), shuning uchun **environment variable**
+orqali yuklanadi:
+
+1. Railway dashboard → Variables tab
+2. `BOT_TOKEN` — Telegram bot token
+3. `INSTAGRAM_COOKIES_TXT` — `cookies.txt` faylining **butun matni**
+   (Browser kengaytmasi orqali export qilingan Netscape format)
+
+Bot ishga tushganda env var o'qib `cookies.txt` fayliga yozadi. Cookies'siz
+Instagram reels/stories deyarli har doim "Download failed" qaytaradi —
+Instagram anonim so'rovlarni tezda 401/403 bilan to'xtatadi.
+
+Cookies'ni yangilash kerak bo'lganda Railway Variables'ni yangilab redeploy qiling.
+
+---
+
 ## Xavfsizlik tavsiyalari
 
 - `.env` git'ga commit qilinmagan (`.gitignore`'da)
