@@ -25,23 +25,40 @@ def fresh_bot(monkeypatch, tmp_path):
 
 def test_rate_limit_allows_first_3(fresh_bot):
     user_id = 100
-    assert fresh_bot._is_rate_limited(user_id) is False
-    assert fresh_bot._is_rate_limited(user_id) is False
-    assert fresh_bot._is_rate_limited(user_id) is False
+    assert fresh_bot._is_rate_limited("url", user_id) is False
+    assert fresh_bot._is_rate_limited("url", user_id) is False
+    assert fresh_bot._is_rate_limited("url", user_id) is False
 
 
 def test_rate_limit_blocks_4th(fresh_bot):
     user_id = 101
     for _ in range(3):
-        fresh_bot._is_rate_limited(user_id)
-    assert fresh_bot._is_rate_limited(user_id) is True
+        fresh_bot._is_rate_limited("url", user_id)
+    assert fresh_bot._is_rate_limited("url", user_id) is True
 
 
 def test_rate_limit_per_user_isolated(fresh_bot):
     for _ in range(3):
-        fresh_bot._is_rate_limited(200)
-    assert fresh_bot._is_rate_limited(200) is True
-    assert fresh_bot._is_rate_limited(201) is False
+        fresh_bot._is_rate_limited("url", 200)
+    assert fresh_bot._is_rate_limited("url", 200) is True
+    assert fresh_bot._is_rate_limited("url", 201) is False
+
+
+def test_rate_limit_buckets_isolated(fresh_bot):
+    """url and cb buckets shouldn't share a counter."""
+    user_id = 250
+    for _ in range(3):
+        fresh_bot._is_rate_limited("url", user_id)
+    # url bucket exhausted, but cb has its own (looser) budget.
+    assert fresh_bot._is_rate_limited("url", user_id) is True
+    assert fresh_bot._is_rate_limited("cb", user_id) is False
+
+
+def test_rate_limit_cb_bucket_has_higher_limit(fresh_bot):
+    user_id = 260
+    # cb bucket allows 15 — 4th call must still pass.
+    for _ in range(4):
+        assert fresh_bot._is_rate_limited("cb", user_id) is False
 
 
 def test_rate_limit_resets_after_window(fresh_bot, monkeypatch):
@@ -55,9 +72,9 @@ def test_rate_limit_resets_after_window(fresh_bot, monkeypatch):
         return v
     monkeypatch.setattr(fresh_bot.time, "monotonic", fake_monotonic)
     for _ in range(3):
-        fresh_bot._is_rate_limited(user_id)
+        fresh_bot._is_rate_limited("url", user_id)
     times.append(base + 31)  # past 30s window
-    assert fresh_bot._is_rate_limited(user_id) is False
+    assert fresh_bot._is_rate_limited("url", user_id) is False
 
 
 # --- Language detection / persistence ---

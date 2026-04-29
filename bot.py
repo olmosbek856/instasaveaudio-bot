@@ -73,20 +73,29 @@ _SEARCH_RESULTS_PER_PAGE = 10
 _SEARCH_TOTAL_LIMIT = 50  # ~5 pages
 _search_cache: dict[str, dict] = {}  # search_id → {query, results, url_keys}
 
-_RATE_WINDOW = 30
-_RATE_MAX = 3
-_rate_store: dict[int, list[float]] = defaultdict(list)
+# Per-bucket (window_seconds, max_requests). URL submissions are tight because
+# each one triggers a yt-dlp/instaloader call. Callbacks are a free click on a
+# cached state, so the limit is looser. Shazam files are mid-weight (ffmpeg +
+# Shazam call + YT search/download).
+_RATE_LIMITS: dict[str, tuple[int, int]] = {
+    "url":    (30, 3),
+    "cb":     (30, 15),
+    "shazam": (60, 5),
+}
+_rate_store: dict[tuple[str, int], list[float]] = defaultdict(list)
 
 # Heights offered to the user. yt-dlp falls back to "best" when a specific
 # height isn't available, so users always get something even on low-res sources.
 QUALITY_HEIGHTS = (480, 720, 1080, 2160)
 
-def _is_rate_limited(user_id: int) -> bool:
+def _is_rate_limited(bucket: str, user_id: int) -> bool:
+    window, limit = _RATE_LIMITS[bucket]
     now = time.monotonic()
-    _rate_store[user_id] = [t for t in _rate_store[user_id] if now - t < _RATE_WINDOW]
-    if len(_rate_store[user_id]) >= _RATE_MAX:
+    key = (bucket, user_id)
+    _rate_store[key] = [t for t in _rate_store[key] if now - t < window]
+    if len(_rate_store[key]) >= limit:
         return True
-    _rate_store[user_id].append(now)
+    _rate_store[key].append(now)
     return False
 
 _LANGS_FILE = os.path.join(os.path.dirname(__file__), "user_langs.json")
@@ -104,6 +113,13 @@ def _save_langs(langs: dict[int, str]) -> None:
             json.dump({str(k): v for k, v in langs.items()}, f)
     except Exception:
         pass
+
+
+async def _save_langs_async(langs: dict[int, str]) -> None:
+    """Off-loop disk write so a slow disk doesn't stall message dispatch."""
+    loop = asyncio.get_running_loop()
+    # Snapshot the dict to avoid mutation during the write thread's lifetime.
+    await loop.run_in_executor(None, _save_langs, dict(langs))
 
 _user_langs: dict[int, str] = _load_langs()
 
@@ -297,7 +313,7 @@ async def lang_callback(callback: CallbackQuery) -> None:
         await callback.answer()
         return
     _user_langs[callback.from_user.id] = chosen
-    _save_langs(_user_langs)
+    await _save_langs_async(_user_langs)
     await callback.answer()
     try:
         await callback.message.delete()
@@ -307,8 +323,21 @@ async def lang_callback(callback: CallbackQuery) -> None:
 
 
 
-async def _deliver_audio(callback: CallbackQuery, url_key: str, url: str, user_lang: str) -> None:
-    """Shared audio-extraction path used by both 'fa:' and 'dl:audio:' callbacks."""
+async def _deliver_audio(
+    callback: CallbackQuery,
+    url_key: str,
+    url: str,
+    user_lang: str,
+    *,
+    strip_markup_on_success: bool = False,
+) -> None:
+    """Shared audio-extraction path used by 'fa:', 'sa:', and 'dl:audio:' callbacks.
+
+    When `strip_markup_on_success` is True, the source message's reply markup
+    is cleared after a successful send — used by the 'fa:' (Audio button under
+    a video) callback so the user can't re-trigger the same expensive download
+    by re-clicking. Search-result pickers ('sa:') keep their markup.
+    """
     status_msg = await callback.message.answer(get_message(user_lang, "downloading"))
 
     meta = _meta_cache.get(url_key, {})
@@ -338,6 +367,11 @@ async def _deliver_audio(callback: CallbackQuery, url_key: str, url: str, user_l
             thumbnail=thumb_input,
             caption=get_message(user_lang, "attribution"),
         )
+        if strip_markup_on_success:
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except TelegramBadRequest:
+                pass  # message gone or already edited — nothing to do
     except Exception as exc:
         logging.error("Audio download failed for %s: %s", url, exc)
         await callback.message.answer(get_message(user_lang, "error"))
@@ -363,8 +397,11 @@ async def audio_callback(callback: CallbackQuery) -> None:
         return
 
     user_lang = _lang(callback.from_user)
+    if callback.from_user and _is_rate_limited("cb", callback.from_user.id):
+        await callback.answer(get_message(user_lang, "rate_limit"), show_alert=True)
+        return
     await callback.answer()
-    await _deliver_audio(callback, url_key, url, user_lang)
+    await _deliver_audio(callback, url_key, url, user_lang, strip_markup_on_success=True)
 
 
 @dp.callback_query(F.data.startswith("sa:"))
@@ -378,8 +415,12 @@ async def search_audio_callback(callback: CallbackQuery) -> None:
     if not callback.message:
         await callback.answer("Error: no message context.")
         return
+    user_lang = _lang(callback.from_user)
+    if callback.from_user and _is_rate_limited("cb", callback.from_user.id):
+        await callback.answer(get_message(user_lang, "rate_limit"), show_alert=True)
+        return
     await callback.answer()
-    await _deliver_audio(callback, url_key, url, _lang(callback.from_user))
+    await _deliver_audio(callback, url_key, url, user_lang)
 
 
 @dp.callback_query(F.data.startswith("sp:"))
@@ -441,6 +482,9 @@ async def download_callback(callback: CallbackQuery) -> None:
         return
 
     user_lang = _lang(callback.from_user)
+    if callback.from_user and _is_rate_limited("cb", callback.from_user.id):
+        await callback.answer(get_message(user_lang, "rate_limit"), show_alert=True)
+        return
     await callback.answer()
 
     # Delete the picker prompt entirely — the user has chosen, the message has no further use.
@@ -612,7 +656,7 @@ async def url_handler(message: Message) -> None:
     text = (message.text or "").strip()
     lang = _lang(message.from_user)
 
-    if message.from_user and _is_rate_limited(message.from_user.id):
+    if message.from_user and _is_rate_limited("url", message.from_user.id):
         await message.answer(get_message(lang, "rate_limit"))
         return
 
@@ -709,18 +753,40 @@ async def _handle_recognition(message: Message, source_path: str) -> None:
             await message.answer(get_message(user_lang, "not_recognized"))
             return
 
-        title_raw = track["title"] or ""
-        artist_raw = track["artist"] or ""
+        title_raw = (track.get("title") or "").strip()
+        artist_raw = (track.get("artist") or "").strip()
+        track_url = (track.get("url") or "").strip()
+
         if not (title_raw and artist_raw):
-            # Shazam returned a partial match we can't search YouTube for cleanly.
-            await message.answer(get_message(user_lang, "not_recognized"))
+            # Partial match — surface whatever we got + Shazam link if any,
+            # rather than silently saying "not recognized".
+            shown_title = _html.escape(title_raw or "?")
+            shown_artist = _html.escape(artist_raw or "?")
+            if track_url:
+                msg = get_message(user_lang, "recognized").format(
+                    title=shown_title, artist=shown_artist, url=track_url,
+                )
+            else:
+                msg = get_message(user_lang, "recognized_no_link").format(
+                    title=shown_title, artist=shown_artist,
+                )
+            await message.answer(msg, disable_web_page_preview=False)
             return
 
         delivered = await _deliver_recognized_song(
             message, title_raw, artist_raw, user_lang,
         )
         if not delivered:
-            await message.answer(get_message(user_lang, "not_recognized"))
+            # Shazam matched cleanly but YouTube didn't yield a downloadable
+            # audio. Tell the user the title/artist instead of pretending we
+            # didn't recognise anything.
+            await message.answer(
+                get_message(user_lang, "recognized_no_audio").format(
+                    title=_html.escape(title_raw),
+                    artist=_html.escape(artist_raw),
+                ),
+                disable_web_page_preview=True,
+            )
     except Exception:
         logging.exception("Recognition failed for %s", source_path)
         await message.answer(get_message(user_lang, "not_recognized"))
@@ -796,9 +862,19 @@ async def _download_telegram_file(file_id: str, suffix: str) -> str:
     return out_path
 
 
+def _shazam_rate_limited(message: Message) -> bool:
+    """True when the user has hit the Shazam-recognition rate limit."""
+    if not message.from_user:
+        return False
+    return _is_rate_limited("shazam", message.from_user.id)
+
+
 @dp.message(F.voice)
 async def voice_handler(message: Message) -> None:
     if message.chat.type != "private":
+        return
+    if _shazam_rate_limited(message):
+        await message.answer(get_message(_lang(message.from_user), "rate_limit"))
         return
     src = await _download_telegram_file(message.voice.file_id, ".ogg")
     try:
@@ -810,6 +886,9 @@ async def voice_handler(message: Message) -> None:
 @dp.message(F.audio)
 async def audio_handler(message: Message) -> None:
     if message.chat.type != "private":
+        return
+    if _shazam_rate_limited(message):
+        await message.answer(get_message(_lang(message.from_user), "rate_limit"))
         return
     suffix = ".mp3"
     name = message.audio.file_name or ""
@@ -826,6 +905,9 @@ async def audio_handler(message: Message) -> None:
 async def video_handler(message: Message) -> None:
     if message.chat.type != "private":
         return
+    if _shazam_rate_limited(message):
+        await message.answer(get_message(_lang(message.from_user), "rate_limit"))
+        return
     src = await _download_telegram_file(message.video.file_id, ".mp4")
     try:
         await _handle_recognition(message, src)
@@ -836,6 +918,9 @@ async def video_handler(message: Message) -> None:
 @dp.message(F.video_note)
 async def video_note_handler(message: Message) -> None:
     if message.chat.type != "private":
+        return
+    if _shazam_rate_limited(message):
+        await message.answer(get_message(_lang(message.from_user), "rate_limit"))
         return
     src = await _download_telegram_file(message.video_note.file_id, ".mp4")
     try:

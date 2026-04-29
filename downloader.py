@@ -389,60 +389,15 @@ def _instaloader_fetch(shortcode: str) -> tuple[dict, list[tuple[str, str]]]:
 
 
 async def extract_direct_urls(url: str, height: int | None = None) -> list[tuple[str, str]]:
-    """Return (cdn_url, ext) pairs without downloading. Fast path (~2-5s)."""
-    content_type = detect_content_type(url)
+    """Return (cdn_url, ext) pairs without downloading. Fast path (~2-5s).
 
-    # Threads: og: scraper succeeds where yt-dlp fails (especially photo posts).
-    if content_type == "threads":
-        _, cdn_items = await fetch_threads_media(url)
-        if cdn_items:
-            return cdn_items
-
-    fmt = _format_for(content_type, height, url)
-
-    ydl_opts = {
-        **_base_opts(),
-        "format": fmt,
-    }
-    cookiefile = _cookiefile_for(url)
-    if cookiefile:
-        ydl_opts["cookiefile"] = cookiefile
-    loop = asyncio.get_running_loop()
-
-    def _extract() -> list[tuple[str, str]]:
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-        except Exception:
-            return []
-        if not info:
-            return []
-        entries = info.get("entries") or [info]
-        result = []
-        for entry in entries:
-            if not entry:
-                continue
-            direct = entry.get("url") or entry.get("manifest_url")
-            ext = (entry.get("ext") or "").lower()
-            if direct:
-                result.append((direct, ext))
-        return result
-
-    items = await loop.run_in_executor(None, _extract)
-    if items:
-        return items
-
-    # Fallback: instaloader handles image posts and carousels (Instagram only)
-    m = _SHORTCODE_PATTERN.search(url)
-    if m and "instagram.com" in url:
-        shortcode = m.group(2)
-        try:
-            _, cdn_items = await loop.run_in_executor(None, _instaloader_fetch, shortcode)
-            return cdn_items
-        except Exception:
-            pass
-
-    return []
+    Delegates to extract_info_full so we share its 5-minute result cache,
+    extract-semaphore, and platform-specific fallbacks (Threads og: scraper,
+    instaloader image-post handler). Without this, clicking the same quality
+    button twice within the cache window costs two full yt-dlp extractions.
+    """
+    _, cdn_items = await extract_info_full(url, height=height)
+    return cdn_items
 
 
 async def download_media(url: str, height: int | None = None) -> list[str]:
