@@ -367,14 +367,11 @@ async def _deliver_audio(
             thumbnail=thumb_input,
             caption=get_message(user_lang, "attribution"),
         )
-        if strip_markup_on_success:
-            try:
-                await callback.message.edit_reply_markup(reply_markup=None)
-            except TelegramBadRequest:
-                pass  # message gone or already edited — nothing to do
+        delivered = True
     except Exception as exc:
         logging.error("Audio download failed for %s: %s", url, exc)
         await callback.message.answer(get_message(user_lang, "error"))
+        delivered = False
     finally:
         try:
             await status_msg.delete()
@@ -382,6 +379,16 @@ async def _deliver_audio(
             pass
         if file_path:
             cleanup(file_path)
+
+    # Markup cleanup is best-effort and runs after the main flow — its failure
+    # must never trigger the outer error message that contradicts a successful
+    # send. Catch broadly: TelegramRetryAfter / TelegramNetworkError can both
+    # surface here on a busy or flaky connection.
+    if delivered and strip_markup_on_success:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
 
 
 @dp.callback_query(F.data.startswith("fa:"))
