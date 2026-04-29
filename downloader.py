@@ -549,6 +549,9 @@ async def download_audio(url: str) -> str:
             "playlist_items": "1",
             "concurrent_fragment_downloads": 10,
         }
+        cookiefile = _cookiefile_for(url)
+        if cookiefile:
+            ydl_opts["cookiefile"] = cookiefile
 
         loop = asyncio.get_running_loop()
 
