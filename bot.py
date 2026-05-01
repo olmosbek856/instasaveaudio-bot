@@ -590,7 +590,7 @@ def _render_search_page(search_id: str, page: int, lang: str) -> tuple[str, Inli
     # Numeric picker — two rows of five (rounded up to actual count).
     num_buttons = [
         InlineKeyboardButton(text=str(i), callback_data=f"sa:{key}")
-        for i, key in enumerate(page_keys, start=1)
+        for i, key in enumerate(page_keys, start=start + 1)
     ]
     rows: list[list[InlineKeyboardButton]] = []
     if num_buttons:
