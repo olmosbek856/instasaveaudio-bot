@@ -392,6 +392,47 @@ async def help_handler(message: Message) -> None:
     await message.answer(get_message(_lang(message.from_user), "help"))
 
 
+@dp.message(Command("stats"))
+async def stats_handler(message: Message) -> None:
+    """Admin-only usage summary. Silently ignored for non-admins."""
+    if not message.from_user or message.from_user.id not in ADMIN_USER_IDS:
+        return
+    try:
+        s = await db.stats_summary()
+        # Per-platform breakdown for the last 24h, fetched directly so the
+        # admin sees where traffic is concentrated.
+        loop = asyncio.get_running_loop()
+        def _platform_breakdown() -> list[tuple[str, int, int]]:
+            cutoff = int(time.time()) - 86400
+            rows = db._get_conn().execute(
+                "SELECT COALESCE(platform,'?') AS p, COUNT(*) AS n, SUM(success) AS ok "
+                "FROM requests WHERE created_at >= ? GROUP BY p ORDER BY n DESC",
+                (cutoff,),
+            ).fetchall()
+            return [(r["p"], int(r["n"]), int(r["ok"] or 0)) for r in rows]
+        breakdown = await loop.run_in_executor(None, _platform_breakdown)
+    except Exception:
+        logging.exception("stats_handler: db read failed")
+        await message.answer("⚠️ Stats unavailable (DB error).")
+        return
+
+    lines = [
+        "📊 <b>Bot statistikasi</b>",
+        "",
+        f"👥 Jami foydalanuvchilar: <b>{s['total_users']}</b>",
+        f"🟢 24 soatda faol: <b>{s['active_24h']}</b>",
+        f"📥 24 soatda so'rovlar: <b>{s['requests_24h']}</b> "
+        f"(muvaffaqiyatli: {s['successes_24h']})",
+    ]
+    if breakdown:
+        lines.append("")
+        lines.append("<b>Platforma bo'yicha (24h):</b>")
+        for platform, n, ok in breakdown:
+            rate = f"{(ok / n * 100):.0f}%" if n else "—"
+            lines.append(f"• <code>{_html.escape(platform)}</code> — {n} ({rate})")
+    await message.answer("\n".join(lines))
+
+
 @dp.callback_query(F.data.startswith("lang:"))
 async def lang_callback(callback: CallbackQuery) -> None:
     chosen = callback.data[len("lang:"):]
