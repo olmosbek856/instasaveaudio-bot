@@ -1,5 +1,5 @@
 aiogram>=3.13.0
-yt-dlp>=2024.1.0
+yt-dlp>=2025.10.0
 python-dotenv>=1.0.0
 instaloader>=4.13
 shazamio>=0.7.0

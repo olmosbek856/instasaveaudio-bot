@@ -430,3 +430,39 @@ async def test_download_media_passes_height_to_format(tmp_path):
             assert "height<=1080" in captured["opts"]["format"]
         finally:
             downloader.TEMP_DIR = original_temp
+
+
+# --- _cookiefile_for: cookies must be passed to YouTube too (datacenter IPs need them) ---
+
+def test_cookiefile_for_returns_path_for_youtube(tmp_path, monkeypatch):
+    import downloader
+    f = tmp_path / "cookies.txt"
+    f.write_text("# Netscape HTTP Cookie File\n" + "x" * 100)
+    monkeypatch.setattr(downloader, "_COOKIES_FILE", str(f))
+    assert downloader._cookiefile_for("https://www.youtube.com/watch?v=x") == str(f)
+    assert downloader._cookiefile_for("https://youtu.be/abc") == str(f)
+
+
+def test_cookiefile_for_still_returns_path_for_instagram(tmp_path, monkeypatch):
+    import downloader
+    f = tmp_path / "cookies.txt"
+    f.write_text("# Netscape HTTP Cookie File\n" + "x" * 100)
+    monkeypatch.setattr(downloader, "_COOKIES_FILE", str(f))
+    assert downloader._cookiefile_for("https://www.instagram.com/reel/ABC/") == str(f)
+
+
+def test_cookiefile_for_returns_none_for_unrelated_url(tmp_path, monkeypatch):
+    import downloader
+    f = tmp_path / "cookies.txt"
+    f.write_text("# Netscape HTTP Cookie File\n" + "x" * 100)
+    monkeypatch.setattr(downloader, "_COOKIES_FILE", str(f))
+    assert downloader._cookiefile_for("https://google.com") is None
+
+
+def test_reload_instaloader_cookies_drops_singleton(monkeypatch):
+    import downloader
+    # Force a sentinel into the singleton, then verify reload nullifies it
+    sentinel = object()
+    monkeypatch.setattr(downloader, "_instaloader_instance", sentinel)
+    downloader._reload_instaloader_cookies()
+    assert downloader._instaloader_instance is None

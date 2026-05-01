@@ -58,10 +58,10 @@ def _looks_like_ig_auth_failure(exc: BaseException) -> bool:
 def _cookiefile_for(url: str) -> str | None:
     """Return cookies.txt path if usable for this URL, else None.
 
-    Instagram blocks most reels/posts/stories anonymously now — passing cookies
-    to yt-dlp is the difference between a 401/403 and a successful extraction.
-    The 50-byte floor filters out an empty placeholder file (just the Netscape
-    header) so yt-dlp doesn't bother with a useless cookie jar.
+    Instagram and YouTube both reject many anonymous requests from datacenter
+    IPs — passing cookies to yt-dlp is the difference between a 401/403 and a
+    successful extraction. yt-dlp ignores domain-mismatched cookies silently,
+    so a jar containing only Instagram cookies is safe to pass for YouTube.
     """
     if not os.path.isfile(_COOKIES_FILE):
         return None
@@ -70,9 +70,17 @@ def _cookiefile_for(url: str) -> str | None:
             return None
     except OSError:
         return None
-    if "instagram.com" in url.lower():
+    url_l = url.lower()
+    if "instagram.com" in url_l or "youtube.com" in url_l or "youtu.be" in url_l:
         return _COOKIES_FILE
     return None
+
+# Late-2025 / 2026 working set:
+#   tv_simply — TV web client, DRM-free (replacement for `tv` after yt-dlp #12563)
+#   mweb      — mobile web, lightweight, no PO-token gate
+#   web       — last-resort fallback; benefits from cookies.txt when present
+_YT_PLAYER_CLIENTS = ["tv_simply", "mweb", "web"]
+
 
 def _base_opts() -> dict:
     opts: dict = {
@@ -89,15 +97,9 @@ def _base_opts() -> dict:
 
 
 def _extra_opts_for(url: str) -> dict:
-    """Per-URL yt-dlp option overrides.
-
-    YouTube's default `web` player client returns "Sign in to confirm you're
-    not a bot" for unauthenticated requests, and the `tv` client now serves
-    DRM-protected formats (yt-dlp issue #12563). The `android` client still
-    returns plain progressive formats; `web` is a last-resort fallback.
-    """
+    """Per-URL yt-dlp option overrides. See `_YT_PLAYER_CLIENTS` for the picks."""
     if "youtube.com" in url.lower() or "youtu.be" in url.lower():
-        return {"extractor_args": {"youtube": {"player_client": ["android", "web"]}}}
+        return {"extractor_args": {"youtube": {"player_client": _YT_PLAYER_CLIENTS}}}
     return {}
 
 
@@ -174,6 +176,17 @@ def _get_instaloader():
     if _instaloader_instance is None:
         _instaloader_instance = _make_instaloader()
     return _instaloader_instance
+
+
+def _reload_instaloader_cookies() -> None:
+    """Drop the singleton so the next caller rebuilds it with a fresh cookie jar.
+
+    Called after the admin uploads a new cookies.txt via /upload_cookies. In-flight
+    requests finish with the old session; the next request pays one constructor
+    cost (~50ms). Attribute writes are atomic in CPython, so no lock is needed.
+    """
+    global _instaloader_instance
+    _instaloader_instance = None
 
 
 # ── Concurrency limiters ────────────────────────────────────────────────────
@@ -545,7 +558,7 @@ async def search_and_download_audio(query: str) -> tuple[str, dict] | None:
         os.makedirs(output_dir, exist_ok=True)
         ydl_opts = {
             **_base_opts(),
-            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+            "extractor_args": {"youtube": {"player_client": _YT_PLAYER_CLIENTS}},
             "format": "bestaudio[ext=m4a]/bestaudio[acodec=aac]/bestaudio",
             "outtmpl": os.path.join(output_dir, "audio.%(ext)s"),
             "default_search": "ytsearch",
@@ -797,7 +810,7 @@ async def search_music(query: str, limit: int = 10) -> list[dict]:
 
     ydl_opts = {
         **_base_opts(),
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+        "extractor_args": {"youtube": {"player_client": _YT_PLAYER_CLIENTS}},
         "extract_flat": True,
         "skip_download": True,
         "default_search": "ytsearch",
