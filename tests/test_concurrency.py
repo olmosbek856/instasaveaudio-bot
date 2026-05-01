@@ -19,15 +19,15 @@ def fresh_downloader():
 # --- Semaphore initialization ---
 
 @pytest.mark.asyncio
-async def test_extract_sem_initialized_with_5(fresh_downloader):
+async def test_extract_sem_initialized_with_8(fresh_downloader):
     sem = fresh_downloader._get_extract_sem()
-    assert sem._value == 5
+    assert sem._value == 8
 
 
 @pytest.mark.asyncio
-async def test_download_sem_initialized_with_3(fresh_downloader):
+async def test_download_sem_initialized_with_4(fresh_downloader):
     sem = fresh_downloader._get_download_sem()
-    assert sem._value == 3
+    assert sem._value == 4
 
 
 @pytest.mark.asyncio
@@ -40,8 +40,8 @@ async def test_extract_sem_singleton(fresh_downloader):
 # --- Concurrency limit enforcement ---
 
 @pytest.mark.asyncio
-async def test_download_sem_limits_to_3(fresh_downloader):
-    """At most 3 coroutines hold the download semaphore at once."""
+async def test_download_sem_limits_to_4(fresh_downloader):
+    """At most 4 coroutines hold the download semaphore at once."""
     sem = fresh_downloader._get_download_sem()
     in_flight = 0
     peak = 0
@@ -58,11 +58,11 @@ async def test_download_sem_limits_to_3(fresh_downloader):
                 in_flight -= 1
 
     await asyncio.gather(*(worker() for _ in range(10)))
-    assert peak == 3
+    assert peak == 4
 
 
 @pytest.mark.asyncio
-async def test_extract_sem_limits_to_5(fresh_downloader):
+async def test_extract_sem_limits_to_8(fresh_downloader):
     sem = fresh_downloader._get_extract_sem()
     in_flight = 0
     peak = 0
@@ -79,7 +79,7 @@ async def test_extract_sem_limits_to_5(fresh_downloader):
                 in_flight -= 1
 
     await asyncio.gather(*(worker() for _ in range(20)))
-    assert peak == 5
+    assert peak == 8
 
 
 # --- Result cache ---

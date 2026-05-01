@@ -24,6 +24,37 @@ class _SilentLogger:
 _COOKIES_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
 
 
+class CookieExpiredError(Exception):
+    """Instagram cookies are expired/invalid — extraction cannot proceed until rotated."""
+    pass
+
+
+# Substrings that, when present in an Instagram-related yt-dlp / instaloader
+# error message, indicate the failure is an auth issue (not a transient
+# network blip). Matching is case-insensitive.
+_IG_AUTH_FAIL_HINTS: tuple[str, ...] = (
+    "login required",
+    "login_required",
+    "loginrequired",
+    "checkpoint",
+    "rate-limit",
+    "rate limit reached",
+    "401",
+    "403",
+    "must be logged in",
+    "login to view",
+    "private account",
+    "this account is private",
+    "this content is not available",
+    "is empty",  # instaloader sometimes raises BadResponseException("Fetching ... is empty")
+)
+
+
+def _looks_like_ig_auth_failure(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(hint in msg for hint in _IG_AUTH_FAIL_HINTS)
+
+
 def _cookiefile_for(url: str) -> str | None:
     """Return cookies.txt path if usable for this URL, else None.
 
@@ -49,19 +80,24 @@ def _base_opts() -> dict:
         "no_warnings": True,
         "ignoreerrors": True,
         "logger": _SilentLogger(),
-        "socket_timeout": 10,
-        "retries": 1,
-        "fragment_retries": 1,
-        "extractor_retries": 0,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-        },
+        "socket_timeout": 20,
+        "retries": 3,
+        "fragment_retries": 3,
+        "extractor_retries": 2,
     }
     return opts
+
+
+def _extra_opts_for(url: str) -> dict:
+    """Per-URL yt-dlp option overrides.
+
+    YouTube's default `web` player client now frequently returns SABR-only
+    formats or "Sign in to confirm you're not a bot". `tv` and `ios` bypass
+    that today; we list them first and keep `web` as a final fallback.
+    """
+    if "youtube.com" in url.lower() or "youtu.be" in url.lower():
+        return {"extractor_args": {"youtube": {"player_client": ["tv", "ios", "web"]}}}
+    return {}
 
 
 # ── Platform registry ──────────────────────────────────────────────────────
@@ -148,14 +184,21 @@ _download_sem: asyncio.Semaphore | None = None
 def _get_extract_sem() -> asyncio.Semaphore:
     global _extract_sem
     if _extract_sem is None:
-        _extract_sem = asyncio.Semaphore(5)  # max 5 parallel info extractions
+        _extract_sem = asyncio.Semaphore(8)  # max 8 parallel info extractions
     return _extract_sem
 
 def _get_download_sem() -> asyncio.Semaphore:
     global _download_sem
     if _download_sem is None:
-        _download_sem = asyncio.Semaphore(3)  # max 3 parallel file downloads
+        _download_sem = asyncio.Semaphore(4)  # max 4 parallel file downloads
     return _download_sem
+
+
+# Hard timeouts wrap blocking yt-dlp work so a hung extractor / slow CDN can't
+# pin a semaphore slot forever (a real concern at 5K MAU when one bad URL would
+# otherwise starve everyone behind it).
+_EXTRACT_TIMEOUT_SEC = 45.0
+_DOWNLOAD_TIMEOUT_SEC = 240.0
 
 
 # ── CDN result cache ────────────────────────────────────────────────────────
@@ -165,6 +208,11 @@ def _get_download_sem() -> asyncio.Semaphore:
 _RESULT_CACHE: dict[tuple[str, int | None], tuple[float, dict, list]] = {}
 _RESULT_CACHE_TTL = 300   # 5 minutes
 _RESULT_CACHE_MAX = 300   # evict oldest when full
+
+# In-flight de-dupe: when two callers ask for the same (url, height) before the
+# first extraction finishes, the second awaits the first's future instead of
+# spawning a parallel yt-dlp run. Catches viral links and double-clicks.
+_inflight: dict[tuple[str, int | None], asyncio.Future] = {}
 
 
 def is_supported_url(url: str) -> bool:
@@ -222,7 +270,7 @@ def _format_for(content_type: str, height: int | None, url: str) -> str:
 
 
 async def extract_info_full(url: str, height: int | None = None) -> tuple[dict, list[tuple[str, str]]]:
-    """Return (metadata_dict, cdn_items_list). Cached + concurrency-limited."""
+    """Return (metadata_dict, cdn_items_list). Cached + concurrency-limited + in-flight de-duped."""
     cache_key = (url, height)
     # Fast path: cache hit (no lock needed — asyncio is single-threaded)
     entry = _RESULT_CACHE.get(cache_key)
@@ -231,22 +279,55 @@ async def extract_info_full(url: str, height: int | None = None) -> tuple[dict, 
         if time.monotonic() - ts < _RESULT_CACHE_TTL:
             return meta, cdn
 
-    async with _get_extract_sem():
-        # Re-check after acquiring semaphore: a sibling may have fetched while we waited
-        entry = _RESULT_CACHE.get(cache_key)
-        if entry:
-            ts, meta, cdn = entry
-            if time.monotonic() - ts < _RESULT_CACHE_TTL:
-                return meta, cdn
+    # If another coroutine is already extracting this exact (url, height),
+    # piggyback on its future instead of acquiring a semaphore slot ourselves.
+    pending = _inflight.get(cache_key)
+    if pending is not None:
+        return await pending
 
-        meta, cdn = await _do_extract_info(url, height=height)
+    fut: asyncio.Future = asyncio.get_running_loop().create_future()
+    _inflight[cache_key] = fut
+    try:
+        async with _get_extract_sem():
+            # Re-check after acquiring semaphore — a sibling may have populated the cache
+            entry = _RESULT_CACHE.get(cache_key)
+            if entry:
+                ts, meta, cdn = entry
+                if time.monotonic() - ts < _RESULT_CACHE_TTL:
+                    if not fut.done():
+                        fut.set_result((meta, cdn))
+                    return meta, cdn
 
-        if cdn:
-            if len(_RESULT_CACHE) >= _RESULT_CACHE_MAX:
-                _RESULT_CACHE.pop(next(iter(_RESULT_CACHE)))
-            _RESULT_CACHE[cache_key] = (time.monotonic(), meta, cdn)
+            try:
+                meta, cdn = await asyncio.wait_for(
+                    _do_extract_info(url, height=height),
+                    timeout=_EXTRACT_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError as e:
+                err = TimeoutError(f"extract_info timed out for {url}")
+                if not fut.done():
+                    fut.set_exception(err)
+                logging.warning("extract_info: timeout (>%.0fs) for %s", _EXTRACT_TIMEOUT_SEC, url)
+                raise err from e
+            except BaseException as e:
+                if not fut.done():
+                    fut.set_exception(e)
+                    # We propagate via `raise` below; mark the future's exception
+                    # as retrieved so asyncio doesn't warn when there are no
+                    # concurrent awaiters piggybacking on this future.
+                    fut.exception()
+                raise
 
-        return meta, cdn
+            if cdn:
+                if len(_RESULT_CACHE) >= _RESULT_CACHE_MAX:
+                    _RESULT_CACHE.pop(next(iter(_RESULT_CACHE)))
+                _RESULT_CACHE[cache_key] = (time.monotonic(), meta, cdn)
+
+            if not fut.done():
+                fut.set_result((meta, cdn))
+            return meta, cdn
+    finally:
+        _inflight.pop(cache_key, None)
 
 
 async def _do_extract_info(url: str, height: int | None = None) -> tuple[dict, list[tuple[str, str]]]:
@@ -281,11 +362,18 @@ async def _do_extract_info(url: str, height: int | None = None) -> tuple[dict, l
                 # that Telegram's servers cannot fetch; yt-dlp returns publicly signed URLs.
                 if cdn_items and all(e in ("jpg", "jpeg", "png", "webp") for _, e in cdn_items):
                     return meta, cdn_items
-            except Exception:
-                pass  # timed out or 403 — fall through to yt-dlp
+            except asyncio.TimeoutError:
+                pass  # exceeded 4s budget — fall through to yt-dlp
+            except Exception as e:
+                # Auth failure (login required / 401 / checkpoint) — bail to a typed
+                # error so the caller can show "cookies expired" instead of "error".
+                if _looks_like_ig_auth_failure(e):
+                    raise CookieExpiredError(f"instaloader: {e}") from e
+                # Anything else (transient network, parser hiccup) → fall through
+                # to yt-dlp which has its own retries.
 
     fmt = _format_for(content_type, height, url)
-    ydl_opts = {**_base_opts(), "format": fmt}
+    ydl_opts = {**_base_opts(), **_extra_opts_for(url), "format": fmt}
     cookiefile = _cookiefile_for(url)
     if cookiefile:
         ydl_opts["cookiefile"] = cookiefile
@@ -294,7 +382,9 @@ async def _do_extract_info(url: str, height: int | None = None) -> tuple[dict, l
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
-        except Exception:
+        except Exception as e:
+            if "instagram.com" in url.lower() and _looks_like_ig_auth_failure(e):
+                raise CookieExpiredError(f"yt-dlp extract: {e}") from e
             logging.exception("yt-dlp extract_info failed for %s", url)
             return {}, []
         if not info:
@@ -307,6 +397,7 @@ async def _do_extract_info(url: str, height: int | None = None) -> tuple[dict, l
             "title":     first.get("title") or first.get("description") or "",
             "uploader":  first.get("uploader") or first.get("channel") or "",
             "thumbnail": first.get("thumbnail") or "",
+            "duration":  int(first.get("duration") or 0),
         }
         cdn_items: list[tuple[str, str]] = []
         for entry in entries:
@@ -363,6 +454,7 @@ def _instaloader_fetch(shortcode: str) -> tuple[dict, list[tuple[str, str]]]:
         "title": "",
         "uploader": post.owner_username or "",
         "thumbnail": thumbnail,
+        "duration": int(getattr(post, "video_duration", 0) or 0),
     }
     return metadata, result
 
@@ -402,6 +494,7 @@ async def download_media(url: str, height: int | None = None) -> list[str]:
 
         ydl_opts = {
             **_base_opts(),
+            **_extra_opts_for(url),
             "format": fmt,
             "outtmpl": os.path.join(output_dir, "%(autonumber)03d_%(title)s.%(ext)s"),
             "concurrent_fragment_downloads": 20,
@@ -413,10 +506,22 @@ async def download_media(url: str, height: int | None = None) -> list[str]:
         loop = asyncio.get_running_loop()
 
         def _download() -> None:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+            except Exception as e:
+                if "instagram.com" in url.lower() and _looks_like_ig_auth_failure(e):
+                    raise CookieExpiredError(f"yt-dlp download: {e}") from e
+                raise
 
-        await loop.run_in_executor(None, _download)
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(None, _download),
+                timeout=_DOWNLOAD_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError as e:
+            shutil.rmtree(output_dir, ignore_errors=True)
+            raise TimeoutError(f"yt-dlp download timed out for {url}") from e
 
         files = sorted(Path(output_dir).iterdir())
         if not files:
@@ -438,6 +543,7 @@ async def search_and_download_audio(query: str) -> tuple[str, dict] | None:
         os.makedirs(output_dir, exist_ok=True)
         ydl_opts = {
             **_base_opts(),
+            "extractor_args": {"youtube": {"player_client": ["tv", "ios", "web"]}},
             "format": "bestaudio[ext=m4a]/bestaudio[acodec=aac]/bestaudio",
             "outtmpl": os.path.join(output_dir, "audio.%(ext)s"),
             "default_search": "ytsearch",
@@ -473,6 +579,7 @@ async def download_audio(url: str) -> str:
 
         ydl_opts = {
             **_base_opts(),
+            **_extra_opts_for(url),
             "format": "bestaudio/best",
             "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
             "postprocessors": [{
@@ -490,10 +597,22 @@ async def download_audio(url: str) -> str:
         loop = asyncio.get_running_loop()
 
         def _download() -> None:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+            except Exception as e:
+                if "instagram.com" in url.lower() and _looks_like_ig_auth_failure(e):
+                    raise CookieExpiredError(f"yt-dlp audio: {e}") from e
+                raise
 
-        await loop.run_in_executor(None, _download)
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(None, _download),
+                timeout=_DOWNLOAD_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError as e:
+            shutil.rmtree(output_dir, ignore_errors=True)
+            raise TimeoutError(f"yt-dlp audio download timed out for {url}") from e
 
         mp3_files = list(Path(output_dir).glob("*.mp3"))
         all_files = list(Path(output_dir).iterdir())
@@ -676,6 +795,7 @@ async def search_music(query: str, limit: int = 10) -> list[dict]:
 
     ydl_opts = {
         **_base_opts(),
+        "extractor_args": {"youtube": {"player_client": ["tv", "ios", "web"]}},
         "extract_flat": True,
         "skip_download": True,
         "default_search": "ytsearch",

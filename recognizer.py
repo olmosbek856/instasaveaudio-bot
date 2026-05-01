@@ -36,7 +36,7 @@ def _get_shazam():
 def _get_sem() -> asyncio.Semaphore:
     global _shazam_sem
     if _shazam_sem is None:
-        _shazam_sem = asyncio.Semaphore(2)
+        _shazam_sem = asyncio.Semaphore(3)
     return _shazam_sem
 
 
@@ -64,10 +64,14 @@ async def extract_audio_clip(input_path: str, out_dir: str) -> str:
         "-q:a", "2",  # high-quality VBR (~190 kbps)
         "-y", out,
         stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
     )
-    await proc.wait()
+    _, err = await proc.communicate()
     if proc.returncode != 0 or not os.path.isfile(out) or os.path.getsize(out) == 0:
+        # Tail of stderr is the only diagnostic for "Shazam silently fails":
+        # surface it instead of swallowing.
+        tail = (err or b"").decode("utf-8", errors="replace")[-500:].strip()
+        logging.error("ffmpeg failed (rc=%s) on %s: %s", proc.returncode, input_path, tail)
         raise RuntimeError(f"ffmpeg failed (rc={proc.returncode}) on {input_path}")
     return out
 

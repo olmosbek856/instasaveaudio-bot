@@ -6,3 +6,9 @@ __pycache__/
 .pytest_cache/
 cookies.txt
 user_langs.json
+user_langs.json.migrated
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

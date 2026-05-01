@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 import time
 import uuid
 from collections import defaultdict
@@ -26,8 +27,20 @@ from aiogram.types import (
     User,
 )
 
-from config import BOT_TOKEN, MAX_FILE_SIZE_BYTES, TEMP_DIR
+import db
+from config import (
+    ADMIN_USER_IDS,
+    BOT_TOKEN,
+    DAILY_QUOTA,
+    DATA_DIR,
+    HEALTH_FILE,
+    LOG_LEVEL,
+    MAX_FILE_SIZE_BYTES,
+    SENTRY_DSN,
+    TEMP_DIR,
+)
 from downloader import (
+    CookieExpiredError,
     _get_instaloader,
     cleanup,
     detect_content_type,
@@ -44,10 +57,42 @@ from downloader import (
 from messages import get_message
 import recognizer
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+
+class _DefaultsFilter(logging.Filter):
+    """Inject `rid` and `uid` defaults so the formatter never KeyErrors when
+    a log call doesn't pass them via `extra=`."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "rid"):
+            record.rid = "-"
+        if not hasattr(record, "uid"):
+            record.uid = "-"
+        return True
+
+
+_root_handler = logging.StreamHandler()
+_root_handler.setFormatter(logging.Formatter(
+    "%(asctime)s %(levelname)s [%(name)s] rid=%(rid)s uid=%(uid)s %(message)s",
+))
+_root_handler.addFilter(_DefaultsFilter())
+logging.basicConfig(level=LOG_LEVEL, handlers=[_root_handler], force=True)
+
+
+# Optional Sentry integration. Skipped silently if SENTRY_DSN is empty
+# or if sentry-sdk is not installed (the dep is optional in requirements.txt).
+if SENTRY_DSN:
+    try:
+        import sentry_sdk
+        sentry_sdk.init(
+            dsn=SENTRY_DSN,
+            traces_sample_rate=0.0,
+            send_default_pii=False,
+            max_breadcrumbs=20,
+        )
+        logging.info("Sentry enabled")
+    except ImportError:
+        logging.warning("SENTRY_DSN set but sentry-sdk not installed; skipping init")
+    except Exception:
+        logging.exception("Sentry init failed; continuing without it")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Copy .env.example to .env and fill in your token.")
@@ -122,6 +167,47 @@ async def _save_langs_async(langs: dict[int, str]) -> None:
     await loop.run_in_executor(None, _save_langs, dict(langs))
 
 _user_langs: dict[int, str] = _load_langs()
+
+
+# Throttle admin DM alerts so a flood of identical errors doesn't spam.
+# Keyed by error_kind → monotonic timestamp of last alert.
+_admin_alert_throttle: dict[str, float] = {}
+_ADMIN_ALERT_INTERVAL_SEC = 3600.0  # at most one DM per error_kind per hour
+
+
+async def _check_user_allowed(user_id: int) -> tuple[bool, str | None]:
+    """Returns (allowed, reason). reason ∈ {'banned', 'quota', None}.
+    Admins bypass both checks. Logs are emitted by the caller after sending feedback."""
+    if user_id in ADMIN_USER_IDS:
+        return True, None
+    try:
+        if await db.is_banned(user_id):
+            return False, "banned"
+        if DAILY_QUOTA > 0 and await db.daily_count(user_id) >= DAILY_QUOTA:
+            return False, "quota"
+    except Exception:
+        # DB hiccup must not break the bot — fail open. The next request
+        # will retry; the noise floor is logged for ops.
+        logging.exception("daily-quota / ban check failed for uid=%d", user_id)
+    return True, None
+
+
+async def _alert_admins(error_kind: str, detail: str = "") -> None:
+    """Best-effort DM to ADMIN_USER_IDS, throttled per error_kind."""
+    if not ADMIN_USER_IDS:
+        return
+    now = time.monotonic()
+    if now - _admin_alert_throttle.get(error_kind, 0.0) < _ADMIN_ALERT_INTERVAL_SEC:
+        return
+    _admin_alert_throttle[error_kind] = now
+    text = f"⚠️ <b>{_html.escape(error_kind)}</b>"
+    if detail:
+        text += f"\n<code>{_html.escape(detail[:200])}</code>"
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception:
+            logging.exception("alert_admins: failed to DM %d", admin_id)
 
 
 def _lang(user: User | None) -> str:
@@ -312,8 +398,18 @@ async def lang_callback(callback: CallbackQuery) -> None:
     if chosen not in ("uz", "ru", "en"):
         await callback.answer()
         return
-    _user_langs[callback.from_user.id] = chosen
-    await _save_langs_async(_user_langs)
+    user_id = callback.from_user.id
+    _user_langs[user_id] = chosen
+    try:
+        await db.set_lang(user_id, chosen)
+    except Exception:
+        # SQLite hiccup must not block the user — the in-memory cache still
+        # serves them this session; we fall back to JSON persistence.
+        logging.exception("db.set_lang failed for uid=%d", user_id)
+        try:
+            await _save_langs_async(_user_langs)
+        except Exception:
+            logging.exception("JSON fallback save_langs also failed")
     await callback.answer()
     try:
         await callback.message.delete()
@@ -368,6 +464,11 @@ async def _deliver_audio(
             caption=get_message(user_lang, "attribution"),
         )
         delivered = True
+    except CookieExpiredError as exc:
+        logging.error("cookie_expired (audio): %s", exc)
+        await callback.message.answer(get_message(user_lang, "cookies_expired"))
+        asyncio.create_task(_alert_admins("ig_cookies_expired", str(exc)))
+        delivered = False
     except Exception as exc:
         logging.error("Audio download failed for %s: %s", url, exc)
         await callback.message.answer(get_message(user_lang, "error"))
@@ -538,6 +639,10 @@ async def download_callback(callback: CallbackQuery) -> None:
             caption=caption,
             reply_markup=audio_kb,
         )
+    except CookieExpiredError as e:
+        logging.error("cookie_expired (quality): %s", e)
+        await callback.message.answer(get_message(user_lang, "cookies_expired"))
+        asyncio.create_task(_alert_admins("ig_cookies_expired", str(e)))
     except Exception:
         logging.exception("Quality download failed for %s @ %sp", url, height)
         await callback.message.answer(get_message(user_lang, "error"))
@@ -667,6 +772,12 @@ async def url_handler(message: Message) -> None:
         await message.answer(get_message(lang, "rate_limit"))
         return
 
+    if message.from_user:
+        allowed, reason = await _check_user_allowed(message.from_user.id)
+        if not allowed:
+            await message.answer(get_message(lang, f"quota_{reason}" if reason == "banned" else "quota_exceeded"))
+            return
+
     # Non-URL text → music search (private chat only; groups stay quiet)
     if not _is_url_text(text):
         if message.chat.type == "private" and len(text) >= 2:
@@ -711,6 +822,7 @@ async def url_handler(message: Message) -> None:
             "title": meta.get("title") or "",
             "uploader": uploader,
             "thumbnail": meta.get("thumbnail") or "",
+            "duration": int(meta.get("duration") or 0),
         }
 
         is_images_only = bool(cdn_items) and all(
@@ -726,20 +838,53 @@ async def url_handler(message: Message) -> None:
                 reply_markup=None,
             )
         else:
-            # Picker shows title only — no "downloaded via" attribution since
-            # nothing has been downloaded yet at this point.
-            picker_text = (
-                f"📹 <b>{_html.escape(uploader)}</b>\n\n{get_message(lang, 'choose_quality')}"
-                if uploader
-                else get_message(lang, "choose_quality")
-            )
+            title = (meta.get("title") or "").strip()
+            if title and uploader and title.lower() == uploader.strip().lower():
+                title = ""
+            if len(title) > 80:
+                title = title[:77].rstrip() + "…"
+            duration_s = _format_duration(meta.get("duration"))
+
+            lines: list[str] = []
+            if uploader:
+                lines.append(f"📹 <b>{_html.escape(uploader)}</b>")
+            if title and duration_s:
+                lines.append(f"🎬 {_html.escape(title)}  ·  <b>{duration_s}</b>")
+            elif title:
+                lines.append(f"🎬 {_html.escape(title)}")
+            elif duration_s:
+                lines.append(f"⏱ <b>{duration_s}</b>")
+            if lines:
+                lines.append("")
+            lines.append(get_message(lang, "choose_quality"))
+            picker_text = "\n".join(lines)
+
             await message.answer(
                 picker_text,
                 reply_markup=_quality_keyboard(url_key, lang),
             )
+        if message.from_user:
+            asyncio.create_task(db.log_request(
+                message.from_user.id, "url",
+                platform=detect_content_type(url), success=True,
+            ))
+    except CookieExpiredError as e:
+        logging.error("cookie_expired: %s", e)
+        await message.answer(get_message(lang, "cookies_expired"))
+        asyncio.create_task(_alert_admins("ig_cookies_expired", str(e)))
+        if message.from_user:
+            asyncio.create_task(db.log_request(
+                message.from_user.id, "url",
+                platform="instagram", success=False, error_kind="cookie_expired",
+            ))
     except Exception:
         logging.exception("Media handling failed for %s", url)
         await message.answer(get_message(lang, "error"))
+        if message.from_user:
+            asyncio.create_task(db.log_request(
+                message.from_user.id, "url",
+                platform=detect_content_type(url), success=False, error_kind="error",
+            ))
     finally:
         try:
             await status_msg.delete()
@@ -753,6 +898,10 @@ async def _handle_recognition(message: Message, source_path: str) -> None:
     user_lang = _lang(message.from_user)
     status_msg = await message.answer(get_message(user_lang, "recognizing"))
     workdir = recognizer.make_workdir()
+    if message.from_user:
+        asyncio.create_task(db.log_request(
+            message.from_user.id, "shazam", success=True,
+        ))
     try:
         clip = await recognizer.extract_audio_clip(source_path, workdir)
         track = await recognizer.recognize(clip)
@@ -876,12 +1025,26 @@ def _shazam_rate_limited(message: Message) -> bool:
     return _is_rate_limited("shazam", message.from_user.id)
 
 
+async def _gate_shazam(message: Message) -> bool:
+    """Apply rate-limit + ban + quota checks to a Shazam request.
+    Returns True when the request may proceed; sends a localized rejection otherwise."""
+    if message.chat.type != "private":
+        return False
+    lang = _lang(message.from_user)
+    if _shazam_rate_limited(message):
+        await message.answer(get_message(lang, "rate_limit"))
+        return False
+    if message.from_user:
+        allowed, reason = await _check_user_allowed(message.from_user.id)
+        if not allowed:
+            await message.answer(get_message(lang, f"quota_{reason}" if reason == "banned" else "quota_exceeded"))
+            return False
+    return True
+
+
 @dp.message(F.voice)
 async def voice_handler(message: Message) -> None:
-    if message.chat.type != "private":
-        return
-    if _shazam_rate_limited(message):
-        await message.answer(get_message(_lang(message.from_user), "rate_limit"))
+    if not await _gate_shazam(message):
         return
     src = await _download_telegram_file(message.voice.file_id, ".ogg")
     try:
@@ -892,10 +1055,7 @@ async def voice_handler(message: Message) -> None:
 
 @dp.message(F.audio)
 async def audio_handler(message: Message) -> None:
-    if message.chat.type != "private":
-        return
-    if _shazam_rate_limited(message):
-        await message.answer(get_message(_lang(message.from_user), "rate_limit"))
+    if not await _gate_shazam(message):
         return
     suffix = ".mp3"
     name = message.audio.file_name or ""
@@ -910,10 +1070,7 @@ async def audio_handler(message: Message) -> None:
 
 @dp.message(F.video)
 async def video_handler(message: Message) -> None:
-    if message.chat.type != "private":
-        return
-    if _shazam_rate_limited(message):
-        await message.answer(get_message(_lang(message.from_user), "rate_limit"))
+    if not await _gate_shazam(message):
         return
     src = await _download_telegram_file(message.video.file_id, ".mp4")
     try:
@@ -924,10 +1081,7 @@ async def video_handler(message: Message) -> None:
 
 @dp.message(F.video_note)
 async def video_note_handler(message: Message) -> None:
-    if message.chat.type != "private":
-        return
-    if _shazam_rate_limited(message):
-        await message.answer(get_message(_lang(message.from_user), "rate_limit"))
+    if not await _gate_shazam(message):
         return
     src = await _download_telegram_file(message.video_note.file_id, ".mp4")
     try:
@@ -936,24 +1090,116 @@ async def video_note_handler(message: Message) -> None:
         cleanup(src)
 
 
+def _purge_stale_temp(max_age_seconds: int = 3600) -> None:
+    """Remove TEMP_DIR entries older than max_age_seconds. Safe across restarts.
+
+    Replaces the previous unconditional wipe so a Docker restart race can't
+    yank files out from under an in-flight handler in another instance.
+    """
+    if not os.path.isdir(TEMP_DIR):
+        return
+    cutoff = time.time() - max_age_seconds
+    for entry in Path(TEMP_DIR).iterdir():
+        try:
+            if entry.stat().st_mtime >= cutoff:
+                continue
+            if entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                try:
+                    entry.unlink()
+                except FileNotFoundError:
+                    pass
+        except Exception:
+            logging.exception("purge_stale_temp: failed on %s", entry)
+
+
+def _check_temp_disk_use() -> None:
+    """Log a warning if temp/ exceeds ~500MB — early signal of cleanup leaks."""
+    if not os.path.isdir(TEMP_DIR):
+        return
+    total = 0
+    for root, _, files in os.walk(TEMP_DIR):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    mb = total / (1024 * 1024)
+    if mb > 500:
+        logging.warning("temp/ disk use is %.0f MB — investigate cleanup", mb)
+    else:
+        logging.info("temp/ disk use: %.0f MB", mb)
+
+
+async def _healthcheck_loop(stop_event: asyncio.Event) -> None:
+    """Touch HEALTH_FILE every 30s. Docker HEALTHCHECK reads its mtime."""
+    Path(HEALTH_FILE).parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            Path(HEALTH_FILE).touch(exist_ok=True)
+        except Exception:
+            logging.exception("healthcheck: failed to touch %s", HEALTH_FILE)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=30.0)
+            return  # stop requested
+        except asyncio.TimeoutError:
+            continue
+
+
+async def _rate_store_sweep_loop(stop_event: asyncio.Event) -> None:
+    """Drop expired entries from _rate_store every 5 minutes — caps memory."""
+    while True:
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=300.0)
+            return  # stop requested
+        except asyncio.TimeoutError:
+            pass
+        now = time.monotonic()
+        for k, ts_list in list(_rate_store.items()):
+            bucket = k[0]
+            window = _RATE_LIMITS.get(bucket, (60, 1))[0]
+            kept = [t for t in ts_list if now - t < window]
+            if kept:
+                _rate_store[k] = kept
+            else:
+                _rate_store.pop(k, None)
+
+
 async def main() -> None:
     global _BOT_USERNAME
-    # Railway / hosted-deploy path: cookies.txt is a secret, so we read it from
-    # the INSTAGRAM_COOKIES_TXT env var and write it to disk before any
+
+    # ── Persistent state setup ─────────────────────────────────────────
+    os.makedirs(DATA_DIR, exist_ok=True)
+    try:
+        db.init_sync()
+        # Hydrate the in-memory lang cache from SQLite so _lang() stays fast/sync.
+        from_db = await db.all_langs()
+        _user_langs.update(from_db)
+        logging.info("DB ready (%d users loaded)", len(from_db))
+    except Exception:
+        logging.exception("DB init failed; continuing with JSON fallback (lang persistence degraded)")
+
+    # ── Cookies bootstrap (Railway-style env-var path) ────────────────
+    # cookies.txt is a secret on hosted deploys, so we read it from
+    # INSTAGRAM_COOKIES_TXT and write it to disk before any
     # instaloader/yt-dlp call. Local Docker compose users keep using the bind mount.
     cookies_env = os.getenv("INSTAGRAM_COOKIES_TXT")
     if cookies_env:
         cookies_path = os.path.join(os.path.dirname(__file__), "cookies.txt")
         try:
-            with open(cookies_path, "w", encoding="utf-8") as f:
+            tmp = cookies_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 f.write(cookies_env)
+            os.replace(tmp, cookies_path)  # atomic
             logging.info("Wrote INSTAGRAM_COOKIES_TXT → %s (%d bytes)", cookies_path, len(cookies_env))
         except Exception:
             logging.exception("Failed to write cookies file from INSTAGRAM_COOKIES_TXT")
-    if os.path.isdir(TEMP_DIR):
-        for entry in Path(TEMP_DIR).iterdir():
-            shutil.rmtree(entry, ignore_errors=True)
+
     os.makedirs(TEMP_DIR, exist_ok=True)
+    _purge_stale_temp()
+    _check_temp_disk_use()
+
     cookies_path_check = os.path.join(os.path.dirname(__file__), "cookies.txt")
     if os.path.isfile(cookies_path_check) and os.path.getsize(cookies_path_check) >= 50:
         logging.info("cookies.txt present (%d bytes) — Instagram authenticated", os.path.getsize(cookies_path_check))
@@ -978,9 +1224,60 @@ async def main() -> None:
             logging.info("Bot username: @%s", _BOT_USERNAME)
     except Exception:
         logging.exception("Failed to fetch bot username via get_me()")
+
+    if ADMIN_USER_IDS:
+        logging.info("Admin user ids: %s", sorted(ADMIN_USER_IDS))
+    if DAILY_QUOTA > 0:
+        logging.info("Daily quota: %d req/user/24h", DAILY_QUOTA)
+
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _get_instaloader)
-    await dp.start_polling(bot)
+
+    # ── Graceful shutdown wiring ───────────────────────────────────────
+    stop_event = asyncio.Event()
+
+    def _request_stop(*_: object) -> None:
+        if not stop_event.is_set():
+            logging.info("Shutdown signal received — draining…")
+            stop_event.set()
+
+    # add_signal_handler is Unix-only; Windows raises NotImplementedError.
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _request_stop)
+        except (NotImplementedError, RuntimeError):
+            pass
+
+    health_task = asyncio.create_task(_healthcheck_loop(stop_event))
+    sweep_task = asyncio.create_task(_rate_store_sweep_loop(stop_event))
+
+    polling_task = asyncio.create_task(
+        dp.start_polling(bot, handle_signals=False)
+    )
+
+    # Wait for either: the polling task to exit, or a shutdown signal.
+    done, _pending = await asyncio.wait(
+        {polling_task, asyncio.create_task(stop_event.wait())},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+
+    # ── Drain ───────────────────────────────────────────────────────────
+    try:
+        await dp.stop_polling()
+    except Exception:
+        logging.exception("dp.stop_polling failed")
+
+    for t in (polling_task, health_task, sweep_task):
+        if not t.done():
+            t.cancel()
+    await asyncio.gather(polling_task, health_task, sweep_task, return_exceptions=True)
+
+    try:
+        await bot.session.close()
+    except Exception:
+        logging.exception("bot.session.close failed")
+    db.close()
+    logging.info("Shutdown complete")
 
 
 if __name__ == "__main__":

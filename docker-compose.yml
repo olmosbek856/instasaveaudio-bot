@@ -5,9 +5,10 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    stop_grace_period: 30s
     volumes:
       - ./cookies.txt:/app/cookies.txt:ro
-      - ./user_langs.json:/app/user_langs.json
+      - ./data:/app/data
     logging:
       driver: json-file
       options:

@@ -78,6 +78,12 @@ MESSAGES = {
         "done_photo": "✅ Mana rasm!",
         "stale_url": "Havola eskirgan. Qaytadan yuboring.",
         "rate_limit": "⏳ Sekinroq yuboring. 30 soniyada 3 ta so'rov.",
+        "quota_exceeded": "⏳ Bugungi limit tugadi. Iltimos, ertaga qayta urinib ko'ring.",
+        "quota_banned": "🚫 Hisobingiz cheklangan. Yordam uchun adminga murojaat qiling.",
+        "cookies_expired": (
+            "⚠️ Instagram autentifikatsiyasi muddati tugagan — admin tez orada yangilaydi.\n"
+            "Boshqa platformalar (YouTube, TikTok, Snapchat, Likee, Pinterest, Threads) ishlamoqda."
+        ),
         "attribution": "📥 @instasaveaudio_bot orqali yuklab olindi ❤️",
         "choose_format": "Yuklab olish formatlari ↓",
         "btn_video": "📼 Video",
@@ -163,6 +169,12 @@ MESSAGES = {
         "done_photo": "✅ Вот фото!",
         "stale_url": "Ссылка устарела. Отправьте заново.",
         "rate_limit": "⏳ Не так быстро. 3 запроса за 30 секунд.",
+        "quota_exceeded": "⏳ Дневной лимит исчерпан. Попробуйте завтра.",
+        "quota_banned": "🚫 Ваш аккаунт ограничен. Обратитесь к администратору.",
+        "cookies_expired": (
+            "⚠️ Срок действия Instagram-авторизации истёк — администратор скоро обновит.\n"
+            "Другие платформы (YouTube, TikTok, Snapchat, Likee, Pinterest, Threads) работают."
+        ),
         "attribution": "📥 Скачано через @instasaveaudio_bot ❤️",
         "choose_format": "Форматы для скачивания ↓",
         "btn_video": "📼 Video",
@@ -248,6 +260,12 @@ MESSAGES = {
         "done_photo": "✅ Here's the photo!",
         "stale_url": "Link expired. Please send it again.",
         "rate_limit": "⏳ Slow down. 3 requests per 30 seconds.",
+        "quota_exceeded": "⏳ Daily limit reached. Please try again tomorrow.",
+        "quota_banned": "🚫 Your account is restricted. Contact the admin for help.",
+        "cookies_expired": (
+            "⚠️ Instagram authentication has expired — the admin will refresh it soon.\n"
+            "Other platforms (YouTube, TikTok, Snapchat, Likee, Pinterest, Threads) still work."
+        ),
         "attribution": "📥 Downloaded via @instasaveaudio_bot ❤️",
         "choose_format": "Download formats ↓",
         "btn_video": "📼 Video",

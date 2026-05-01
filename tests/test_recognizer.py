@@ -123,8 +123,12 @@ async def test_extract_audio_clip_invokes_ffmpeg(fresh_recognizer, tmp_path):
     class FakeProc:
         returncode = 0
         async def wait(self):
-            # Simulate ffmpeg producing a non-empty file
             Path(captured["out"]).write_bytes(b"fake-mp3" * 16)
+        async def communicate(self):
+            # Simulate ffmpeg producing a non-empty file (post-edit: ffmpeg's
+            # stderr is now captured for diagnostic purposes — return empty bytes)
+            Path(captured["out"]).write_bytes(b"fake-mp3" * 16)
+            return (b"", b"")
 
     async def fake_exec(*args, **kwargs):
         captured["args"] = args
@@ -149,6 +153,8 @@ async def test_extract_audio_clip_raises_on_ffmpeg_failure(fresh_recognizer, tmp
         returncode = 1
         async def wait(self):
             return None
+        async def communicate(self):
+            return (b"", b"ffmpeg simulated failure")
 
     async def fake_exec(*args, **kwargs):
         return FakeProc()
@@ -159,7 +165,7 @@ async def test_extract_audio_clip_raises_on_ffmpeg_failure(fresh_recognizer, tmp
 
 
 @pytest.mark.asyncio
-async def test_shazam_semaphore_limits_to_2(fresh_recognizer):
+async def test_shazam_semaphore_limits_to_3(fresh_recognizer):
     sem = fresh_recognizer._get_sem()
     in_flight = 0
     peak = 0
@@ -176,4 +182,4 @@ async def test_shazam_semaphore_limits_to_2(fresh_recognizer):
                 in_flight -= 1
 
     await asyncio.gather(*(worker() for _ in range(10)))
-    assert peak == 2
+    assert peak == 3
