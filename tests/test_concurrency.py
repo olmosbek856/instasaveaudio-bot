@@ -21,13 +21,13 @@ def fresh_downloader():
 @pytest.mark.asyncio
 async def test_extract_sem_initialized_with_8(fresh_downloader):
     sem = fresh_downloader._get_extract_sem()
-    assert sem._value == 8
+    assert sem._value == 24
 
 
 @pytest.mark.asyncio
 async def test_download_sem_initialized_with_4(fresh_downloader):
     sem = fresh_downloader._get_download_sem()
-    assert sem._value == 4
+    assert sem._value == 12
 
 
 @pytest.mark.asyncio
@@ -57,8 +57,8 @@ async def test_download_sem_limits_to_4(fresh_downloader):
             async with lock:
                 in_flight -= 1
 
-    await asyncio.gather(*(worker() for _ in range(10)))
-    assert peak == 4
+    await asyncio.gather(*(worker() for _ in range(20)))
+    assert peak == 12
 
 
 @pytest.mark.asyncio
@@ -78,8 +78,8 @@ async def test_extract_sem_limits_to_8(fresh_downloader):
             async with lock:
                 in_flight -= 1
 
-    await asyncio.gather(*(worker() for _ in range(20)))
-    assert peak == 8
+    await asyncio.gather(*(worker() for _ in range(40)))
+    assert peak == 24
 
 
 # --- Result cache ---

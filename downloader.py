@@ -91,12 +91,13 @@ def _base_opts() -> dict:
 def _extra_opts_for(url: str) -> dict:
     """Per-URL yt-dlp option overrides.
 
-    YouTube's default `web` player client now frequently returns SABR-only
-    formats or "Sign in to confirm you're not a bot". `tv` and `ios` bypass
-    that today; we list them first and keep `web` as a final fallback.
+    YouTube's default `web` player client returns "Sign in to confirm you're
+    not a bot" for unauthenticated requests, and the `tv` client now serves
+    DRM-protected formats (yt-dlp issue #12563). The `android` client still
+    returns plain progressive formats; `web` is a last-resort fallback.
     """
     if "youtube.com" in url.lower() or "youtu.be" in url.lower():
-        return {"extractor_args": {"youtube": {"player_client": ["tv", "ios", "web"]}}}
+        return {"extractor_args": {"youtube": {"player_client": ["android", "web"]}}}
     return {}
 
 
@@ -184,21 +185,22 @@ _download_sem: asyncio.Semaphore | None = None
 def _get_extract_sem() -> asyncio.Semaphore:
     global _extract_sem
     if _extract_sem is None:
-        _extract_sem = asyncio.Semaphore(8)  # max 8 parallel info extractions
+        _extract_sem = asyncio.Semaphore(24)  # max 24 parallel info extractions
     return _extract_sem
 
 def _get_download_sem() -> asyncio.Semaphore:
     global _download_sem
     if _download_sem is None:
-        _download_sem = asyncio.Semaphore(4)  # max 4 parallel file downloads
+        _download_sem = asyncio.Semaphore(12)  # max 12 parallel file downloads
     return _download_sem
 
 
 # Hard timeouts wrap blocking yt-dlp work so a hung extractor / slow CDN can't
-# pin a semaphore slot forever (a real concern at 5K MAU when one bad URL would
-# otherwise starve everyone behind it).
-_EXTRACT_TIMEOUT_SEC = 45.0
-_DOWNLOAD_TIMEOUT_SEC = 240.0
+# pin a semaphore slot forever. Tuned generously: YouTube with multi-client
+# fallback (tv→ios→web) plus 3 retries can legitimately spend 60-80s on a
+# slow extraction, and full audio+ffmpeg can spend several minutes.
+_EXTRACT_TIMEOUT_SEC = 120.0
+_DOWNLOAD_TIMEOUT_SEC = 600.0
 
 
 # ── CDN result cache ────────────────────────────────────────────────────────
@@ -206,8 +208,8 @@ _DOWNLOAD_TIMEOUT_SEC = 240.0
 # Different heights produce different CDN URLs, so they cache independently.
 
 _RESULT_CACHE: dict[tuple[str, int | None], tuple[float, dict, list]] = {}
-_RESULT_CACHE_TTL = 300   # 5 minutes
-_RESULT_CACHE_MAX = 300   # evict oldest when full
+_RESULT_CACHE_TTL = 1800  # 30 minutes
+_RESULT_CACHE_MAX = 2000  # evict oldest when full
 
 # In-flight de-dupe: when two callers ask for the same (url, height) before the
 # first extraction finishes, the second awaits the first's future instead of
@@ -422,7 +424,7 @@ async def fetch_instagram_meta(url: str) -> dict:
     try:
         meta, _ = await asyncio.wait_for(
             loop.run_in_executor(None, _instaloader_fetch, shortcode),
-            timeout=3.0,
+            timeout=8.0,
         )
         return meta
     except Exception:
@@ -543,7 +545,7 @@ async def search_and_download_audio(query: str) -> tuple[str, dict] | None:
         os.makedirs(output_dir, exist_ok=True)
         ydl_opts = {
             **_base_opts(),
-            "extractor_args": {"youtube": {"player_client": ["tv", "ios", "web"]}},
+            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
             "format": "bestaudio[ext=m4a]/bestaudio[acodec=aac]/bestaudio",
             "outtmpl": os.path.join(output_dir, "audio.%(ext)s"),
             "default_search": "ytsearch",
@@ -795,7 +797,7 @@ async def search_music(query: str, limit: int = 10) -> list[dict]:
 
     ydl_opts = {
         **_base_opts(),
-        "extractor_args": {"youtube": {"player_client": ["tv", "ios", "web"]}},
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
         "extract_flat": True,
         "skip_download": True,
         "default_search": "ytsearch",

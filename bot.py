@@ -104,7 +104,7 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-_URL_CACHE_MAX = 500
+_URL_CACHE_MAX = 10000
 _url_cache: dict[str, str] = {}
 _meta_cache: dict[str, dict] = {}  # url_key → {title, uploader, thumbnail}
 
