@@ -16,10 +16,19 @@ from config import TEMP_DIR
 
 
 class _SilentLogger:
+    """Suppresses yt-dlp console output but records the last error message
+    so callers can include it in their exception text. The single attribute
+    `last_error` is the most recent string passed to `.error()`.
+    """
+    def __init__(self) -> None:
+        self.last_error: str = ""
+
     def debug(self, msg: str) -> None: pass
     def info(self, msg: str) -> None: pass
     def warning(self, msg: str) -> None: pass
-    def error(self, msg: str) -> None: pass
+
+    def error(self, msg: str) -> None:
+        self.last_error = msg
 
 _COOKIES_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
 
@@ -592,9 +601,13 @@ async def download_audio(url: str) -> str:
         output_dir = os.path.join(TEMP_DIR, str(uuid.uuid4()))
         os.makedirs(output_dir, exist_ok=True)
 
+        # Per-call logger so we can recover the last yt-dlp error message
+        # if the download silently produces nothing.
+        capture_logger = _SilentLogger()
         ydl_opts = {
             **_base_opts(),
             **_extra_opts_for(url),
+            "logger": capture_logger,
             "format": "bestaudio/best",
             "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
             "postprocessors": [{
@@ -634,7 +647,8 @@ async def download_audio(url: str) -> str:
         files = mp3_files if mp3_files else all_files
 
         if not files:
-            raise FileNotFoundError("yt-dlp produced no audio")
+            detail = capture_logger.last_error or "no formats / unknown reason"
+            raise FileNotFoundError(f"yt-dlp produced no audio — {detail[:200]}")
 
         return str(files[0])
 
