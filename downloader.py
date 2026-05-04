@@ -122,11 +122,15 @@ def _cookiefile_for(url: str) -> str | None:
     except OSError:
         return None
     url_l = url.lower()
-    # YouTube intentionally excluded as of 2026.05: cookies cause yt-dlp to
-    # *skip* the android/ios clients (the only ones still returning playable
-    # formats without a PO token or JS-runtime sig solving). Passing cookies
-    # to a YT extraction now reliably yields "only images available."
-    if "instagram.com" in url_l:
+    # On datacenter IPs (e.g. DigitalOcean Droplets), YouTube returns
+    # "Sign in to confirm you're not a bot" without cookies. So we DO pass
+    # cookies for YouTube on hosted deploys. Note: yt-dlp auto-skips
+    # android/ios clients when cookies are present, so we rely on
+    # tv_simply/mweb/web from _YT_PLAYER_CLIENTS — those work with cookies
+    # because the session implicitly provides what would otherwise need a
+    # PO token. On residential IPs (no DC-IP blocking) the cookies-free
+    # android client is still preferred, but that's not the deploy target.
+    if "instagram.com" in url_l or "youtube.com" in url_l or "youtu.be" in url_l:
         return _COOKIES_FILE
     return None
 
