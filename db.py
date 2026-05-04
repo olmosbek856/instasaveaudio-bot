@@ -63,6 +63,21 @@ CREATE TABLE IF NOT EXISTS requests (
 );
 CREATE INDEX IF NOT EXISTS idx_requests_user_day ON requests(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_requests_created ON requests(created_at);
+CREATE TABLE IF NOT EXISTS media_cache (
+    content_key  TEXT PRIMARY KEY,
+    file_id      TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    file_size    INTEGER,
+    duration     INTEGER,
+    title        TEXT,
+    uploader     TEXT,
+    thumbnail    TEXT,
+    extra        TEXT,
+    created_at   INTEGER NOT NULL,
+    last_used_at INTEGER NOT NULL,
+    hits         INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_media_cache_lru ON media_cache(last_used_at);
 """
 
 
@@ -197,6 +212,92 @@ def _all_langs_sync() -> dict[int, str]:
     return {int(r["user_id"]): r["lang"] for r in rows}
 
 
+def _media_cache_get_sync(content_key: str) -> dict | None:
+    row = _get_conn().execute(
+        "SELECT content_key, file_id, kind, file_size, duration, title, uploader, "
+        "thumbnail, extra, created_at, last_used_at, hits "
+        "FROM media_cache WHERE content_key = ?",
+        (content_key,),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "content_key":  row["content_key"],
+        "file_id":      row["file_id"],
+        "kind":         row["kind"],
+        "file_size":    row["file_size"],
+        "duration":     row["duration"],
+        "title":        row["title"],
+        "uploader":     row["uploader"],
+        "thumbnail":    row["thumbnail"],
+        "extra":        row["extra"],
+        "created_at":   row["created_at"],
+        "last_used_at": row["last_used_at"],
+        "hits":         row["hits"],
+    }
+
+
+def _media_cache_put_sync(
+    content_key: str,
+    file_id: str,
+    kind: str,
+    *,
+    file_size: int | None = None,
+    duration: int | None = None,
+    title: str | None = None,
+    uploader: str | None = None,
+    thumbnail: str | None = None,
+    extra: str | None = None,
+) -> None:
+    now = int(time.time())
+    _get_conn().execute(
+        "INSERT INTO media_cache(content_key, file_id, kind, file_size, duration, "
+        "title, uploader, thumbnail, extra, created_at, last_used_at, hits) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0) "
+        "ON CONFLICT(content_key) DO UPDATE SET "
+        "file_id=excluded.file_id, kind=excluded.kind, file_size=excluded.file_size, "
+        "duration=excluded.duration, title=excluded.title, uploader=excluded.uploader, "
+        "thumbnail=excluded.thumbnail, extra=excluded.extra, "
+        "created_at=excluded.created_at, last_used_at=excluded.last_used_at",
+        (content_key, file_id, kind, file_size, duration, title, uploader,
+         thumbnail, extra, now, now),
+    )
+
+
+def _media_cache_touch_sync(content_key: str) -> None:
+    now = int(time.time())
+    _get_conn().execute(
+        "UPDATE media_cache SET hits = hits + 1, last_used_at = ? WHERE content_key = ?",
+        (now, content_key),
+    )
+
+
+def _media_cache_delete_sync(content_key: str) -> None:
+    _get_conn().execute(
+        "DELETE FROM media_cache WHERE content_key = ?", (content_key,),
+    )
+
+
+def _media_cache_evict_sync(max_rows: int = 100_000, ttl_days: int = 30) -> int:
+    """Drop entries older than TTL or above max_rows (LRU). Returns # rows deleted."""
+    conn = _get_conn()
+    cutoff = int(time.time()) - ttl_days * 86400
+    deleted = 0
+    cur = conn.execute("DELETE FROM media_cache WHERE last_used_at < ?", (cutoff,))
+    deleted += cur.rowcount or 0
+    row = conn.execute("SELECT COUNT(*) AS c FROM media_cache").fetchone()
+    count = int(row["c"]) if row else 0
+    if count > max_rows:
+        excess = count - max_rows
+        cur = conn.execute(
+            "DELETE FROM media_cache WHERE content_key IN ("
+            "SELECT content_key FROM media_cache ORDER BY last_used_at ASC LIMIT ?)",
+            (excess,),
+        )
+        deleted += cur.rowcount or 0
+    return deleted
+
+
 def _stats_summary_sync() -> dict:
     """Lightweight admin summary (used by /admin in future, harmless to leave)."""
     conn = _get_conn()
@@ -271,6 +372,42 @@ async def all_langs() -> dict[int, str]:
 
 async def stats_summary() -> dict:
     return await _run(_stats_summary_sync)
+
+
+async def media_cache_get(content_key: str) -> dict | None:
+    return await _run(_media_cache_get_sync, content_key)
+
+
+async def media_cache_put(
+    content_key: str,
+    file_id: str,
+    kind: str,
+    *,
+    file_size: int | None = None,
+    duration: int | None = None,
+    title: str | None = None,
+    uploader: str | None = None,
+    thumbnail: str | None = None,
+    extra: str | None = None,
+) -> None:
+    await _run(
+        _media_cache_put_sync,
+        content_key, file_id, kind,
+        file_size=file_size, duration=duration, title=title,
+        uploader=uploader, thumbnail=thumbnail, extra=extra,
+    )
+
+
+async def media_cache_touch(content_key: str) -> None:
+    await _run(_media_cache_touch_sync, content_key)
+
+
+async def media_cache_delete(content_key: str) -> None:
+    await _run(_media_cache_delete_sync, content_key)
+
+
+async def media_cache_evict(max_rows: int = 100_000, ttl_days: int = 30) -> int:
+    return await _run(_media_cache_evict_sync, max_rows, ttl_days)
 
 
 def close() -> None:

@@ -44,7 +44,9 @@ import downloader
 from downloader import (
     CookieExpiredError,
     _get_instaloader,
+    _is_safe_public_url,
     cleanup,
+    content_cache_key,
     detect_content_type,
     download_audio,
     download_cdn_url,
@@ -155,11 +157,20 @@ def _load_langs() -> dict[int, str]:
         return {}
 
 def _save_langs(langs: dict[int, str]) -> None:
+    # Atomic write — partial json.dump on crash/disk-full would otherwise
+    # leave the file empty and silently wipe every user's saved language.
+    tmp = _LANGS_FILE + ".tmp"
     try:
-        with open(_LANGS_FILE, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump({str(k): v for k, v in langs.items()}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, _LANGS_FILE)
     except Exception:
-        pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 async def _save_langs_async(langs: dict[int, str]) -> None:
@@ -269,20 +280,127 @@ async def _send_media(
     lang_code: str = "uz",
     caption: str = "",
     reply_markup: InlineKeyboardMarkup | None = None,
-) -> None:
+) -> Message | None:
+    """Returns the sent Message so callers can capture file_id for caching."""
     if os.path.getsize(file_path) > MAX_FILE_SIZE_BYTES:
         await message.answer(get_message(lang_code, "too_large"))
-        return
+        return None
 
     ext = Path(file_path).suffix.lower()
     file = FSInputFile(file_path)
 
     if ext in (".mp4", ".mov", ".avi", ".mkv", ".webm"):
-        await message.answer_video(video=file, caption=caption, reply_markup=reply_markup)
+        return await message.answer_video(video=file, caption=caption, reply_markup=reply_markup)
     elif ext in (".jpg", ".jpeg", ".png", ".webp"):
-        await message.answer_photo(photo=file, caption=caption, reply_markup=reply_markup)
+        return await message.answer_photo(photo=file, caption=caption, reply_markup=reply_markup)
     else:
-        await message.answer_document(document=file, caption=caption, reply_markup=reply_markup)
+        return await message.answer_document(document=file, caption=caption, reply_markup=reply_markup)
+
+
+async def _persist_media_cache(
+    cache_key: str,
+    sent: Message | list[Message] | None,
+) -> None:
+    """Best-effort capture of file_id(s) from a successful send. Errors swallowed —
+    caching must never break the user flow.
+
+    For media groups we store the per-item list (file_id + type) in `extra` as
+    JSON so a cache hit can rebuild the exact same group.
+    """
+    if not cache_key or not sent:
+        return
+    try:
+        if isinstance(sent, list):
+            items: list[dict] = []
+            for m in sent:
+                if getattr(m, "video", None):
+                    items.append({"type": "video", "file_id": m.video.file_id})
+                elif getattr(m, "photo", None):
+                    items.append({"type": "photo", "file_id": m.photo[-1].file_id})
+            if items:
+                await db.media_cache_put(
+                    cache_key, items[0]["file_id"], "media_group",
+                    extra=json.dumps(items),
+                )
+            return
+        if getattr(sent, "video", None):
+            await db.media_cache_put(
+                cache_key, sent.video.file_id, "video",
+                file_size=getattr(sent.video, "file_size", None),
+                duration=getattr(sent.video, "duration", None),
+            )
+        elif getattr(sent, "photo", None):
+            await db.media_cache_put(
+                cache_key, sent.photo[-1].file_id, "photo",
+                file_size=getattr(sent.photo[-1], "file_size", None),
+            )
+        elif getattr(sent, "audio", None):
+            await db.media_cache_put(
+                cache_key, sent.audio.file_id, "audio",
+                file_size=getattr(sent.audio, "file_size", None),
+                duration=getattr(sent.audio, "duration", None),
+                title=getattr(sent.audio, "title", None),
+                uploader=getattr(sent.audio, "performer", None),
+            )
+    except Exception:
+        logging.exception("media_cache persist failed for key=%s", cache_key)
+
+
+async def _try_video_cache_hit(
+    message: Message,
+    cache_key: str,
+    caption: str,
+    reply_markup: InlineKeyboardMarkup | None,
+) -> bool:
+    """Replay a cached video/photo/media_group send. Returns True on hit, False on miss
+    or stale entry (which is auto-deleted)."""
+    try:
+        cached = await db.media_cache_get(cache_key)
+    except Exception:
+        return False
+    if not cached:
+        return False
+    try:
+        kind = cached["kind"]
+        if kind == "video":
+            await message.answer_video(
+                video=cached["file_id"], caption=caption, reply_markup=reply_markup,
+            )
+        elif kind == "photo":
+            await message.answer_photo(
+                photo=cached["file_id"], caption=caption, reply_markup=reply_markup,
+            )
+        elif kind == "media_group":
+            items = json.loads(cached.get("extra") or "[]")
+            if not items:
+                raise RuntimeError("empty media_group cache")
+            media_list: list = []
+            for i, item in enumerate(items):
+                cap = caption if i == 0 else ""
+                if item["type"] == "photo":
+                    media_list.append(InputMediaPhoto(media=item["file_id"], caption=cap))
+                else:
+                    media_list.append(InputMediaVideo(media=item["file_id"], caption=cap))
+            await message.answer_media_group(media=media_list)
+            if reply_markup:
+                await message.answer(caption, reply_markup=reply_markup)
+        else:
+            return False
+        try:
+            await db.media_cache_touch(cache_key)
+        except Exception:
+            pass
+        return True
+    except TelegramBadRequest:
+        # Stale file_id — drop and fall through to fresh download.
+        try:
+            await db.media_cache_delete(cache_key)
+        except Exception:
+            pass
+        return False
+    except Exception:
+        logging.exception("cache hit replay failed for key=%s", cache_key)
+        return False
 
 
 async def _send_video_content(
@@ -294,9 +412,15 @@ async def _send_video_content(
     caption: str = "",
     reply_markup: InlineKeyboardMarkup | None = None,
 ) -> None:
-    """Download and send video/photo content. Tries CDN fast path first, falls back to disk."""
+    """Download and send video/photo content. Tries cache → CDN → disk."""
     if not caption:
         caption = get_message(user_lang, "attribution")
+
+    # Persistent file_id cache — instant replay if we've sent this before.
+    cache_key = content_cache_key(url, "video", height)
+    if cache_key and await _try_video_cache_hit(message, cache_key, caption, reply_markup):
+        return
+
     file_paths: list[str] = []
     try:
         cdn_items = (
@@ -310,16 +434,20 @@ async def _send_video_content(
                 is_photo = ext in ("jpg", "jpeg", "png", "webp")
                 try:
                     if is_photo:
-                        await message.answer_photo(photo=cdn_url, caption=caption, reply_markup=reply_markup)
+                        sent = await message.answer_photo(photo=cdn_url, caption=caption, reply_markup=reply_markup)
                     else:
-                        await message.answer_video(video=cdn_url, caption=caption, reply_markup=reply_markup)
+                        sent = await message.answer_video(video=cdn_url, caption=caption, reply_markup=reply_markup)
+                    if cache_key:
+                        asyncio.create_task(_persist_media_cache(cache_key, sent))
                     return
                 except TelegramBadRequest:
                     # Telegram can't fetch Instagram CDN — download directly via aiohttp
                     try:
                         fp = await download_cdn_url(cdn_url, ext)
                         file_paths = [fp]
-                        await _send_media(message, fp, lang_code=user_lang, caption=caption, reply_markup=reply_markup)
+                        sent = await _send_media(message, fp, lang_code=user_lang, caption=caption, reply_markup=reply_markup)
+                        if cache_key:
+                            asyncio.create_task(_persist_media_cache(cache_key, sent))
                         return
                     except Exception:
                         pass  # Last resort: full yt-dlp re-download
@@ -333,17 +461,20 @@ async def _send_video_content(
                             media_list.append(InputMediaPhoto(media=cdn_url, caption=cap))
                         else:
                             media_list.append(InputMediaVideo(media=cdn_url, caption=cap))
-                    await message.answer_media_group(media=media_list)
+                    sent = await message.answer_media_group(media=media_list)
+                    if cache_key:
+                        asyncio.create_task(_persist_media_cache(cache_key, sent))
                     if reply_markup:
                         await message.answer(caption, reply_markup=reply_markup)
                     return
                 except TelegramBadRequest:
-                    # Download each CDN URL directly via aiohttp
+                    # Download each CDN URL directly via aiohttp. Append to
+                    # file_paths as we go so a partial failure still gets
+                    # cleaned up by the outer finally.
                     try:
-                        fps = []
                         for cdn_u, cdn_e in cdn_items:
-                            fps.append(await download_cdn_url(cdn_u, cdn_e))
-                        file_paths = fps
+                            file_paths.append(await download_cdn_url(cdn_u, cdn_e))
+                        fps = file_paths
                         media_list = []
                         for i, fp in enumerate(fps):
                             e = Path(fp).suffix.lower().lstrip(".")
@@ -353,7 +484,9 @@ async def _send_video_content(
                                 media_list.append(InputMediaPhoto(media=f, caption=cap))
                             else:
                                 media_list.append(InputMediaVideo(media=f, caption=cap))
-                        await message.answer_media_group(media=media_list)
+                        sent = await message.answer_media_group(media=media_list)
+                        if cache_key:
+                            asyncio.create_task(_persist_media_cache(cache_key, sent))
                         if reply_markup:
                             await message.answer(caption, reply_markup=reply_markup)
                         return
@@ -362,7 +495,9 @@ async def _send_video_content(
 
         file_paths = await download_media(url, height=height)
         if len(file_paths) == 1:
-            await _send_media(message, file_paths[0], lang_code=user_lang, caption=caption, reply_markup=reply_markup)
+            sent = await _send_media(message, file_paths[0], lang_code=user_lang, caption=caption, reply_markup=reply_markup)
+            if cache_key:
+                asyncio.create_task(_persist_media_cache(cache_key, sent))
         else:
             media_list = []
             for i, fp in enumerate(file_paths):
@@ -374,12 +509,21 @@ async def _send_video_content(
                     media_list.append(InputMediaPhoto(media=f, caption=cap))
                 else:
                     media_list.append(InputMediaVideo(media=f, caption=cap))
-            await message.answer_media_group(media=media_list)
+            sent = await message.answer_media_group(media=media_list)
+            if cache_key:
+                asyncio.create_task(_persist_media_cache(cache_key, sent))
             if reply_markup:
                 await message.answer(caption, reply_markup=reply_markup)
     finally:
-        if file_paths:
-            cleanup(file_paths[0])
+        # Each path may live in its own UUID temp dir (download_cdn_url creates
+        # one per call), so wipe every distinct parent — not just the first.
+        seen_parents: set[str] = set()
+        for fp in file_paths:
+            parent = str(Path(fp).parent)
+            if parent in seen_parents:
+                continue
+            seen_parents.add(parent)
+            cleanup(fp)
 
 
 @dp.message(CommandStart())
@@ -598,6 +742,41 @@ async def _deliver_audio(
     a video) callback so the user can't re-trigger the same expensive download
     by re-clicking. Search-result pickers ('sa:') keep their markup.
     """
+    # Persistent file_id cache — instant replay if we've delivered this audio before.
+    audio_cache_key = content_cache_key(url, "audio")
+    if audio_cache_key:
+        try:
+            cached = await db.media_cache_get(audio_cache_key)
+        except Exception:
+            cached = None
+        if cached and cached.get("kind") == "audio":
+            try:
+                await callback.message.answer_audio(
+                    audio=cached["file_id"],
+                    title=cached.get("title") or None,
+                    performer=cached.get("uploader") or None,
+                    caption=get_message(user_lang, "attribution"),
+                )
+                try:
+                    await db.media_cache_touch(audio_cache_key)
+                except Exception:
+                    pass
+                if strip_markup_on_success:
+                    try:
+                        await callback.message.edit_reply_markup(reply_markup=None)
+                    except Exception:
+                        pass
+                # Best-effort delete of the "downloading…" status (no-op if not yet posted).
+                return
+            except TelegramBadRequest:
+                # Stale file_id — drop and fall through to fresh download.
+                try:
+                    await db.media_cache_delete(audio_cache_key)
+                except Exception:
+                    pass
+            except Exception:
+                logging.exception("audio cache hit replay failed for %s", audio_cache_key)
+
     status_msg = await callback.message.answer(get_message(user_lang, "downloading"))
 
     meta = _meta_cache.get(url_key, {})
@@ -610,7 +789,7 @@ async def _deliver_audio(
         file_path = await download_audio(url)
         audio_file = FSInputFile(file_path)
         thumb_input = None
-        if thumbnail_url:
+        if thumbnail_url and _is_safe_public_url(thumbnail_url):
             try:
                 import aiohttp
                 async with aiohttp.ClientSession() as session:
@@ -620,13 +799,15 @@ async def _deliver_audio(
                             thumb_input = BufferedInputFile(thumb_data, filename="thumb.jpg")
             except Exception:
                 pass
-        await callback.message.answer_audio(
+        sent = await callback.message.answer_audio(
             audio=audio_file,
             title=audio_title or None,
             performer=audio_performer or None,
             thumbnail=thumb_input,
             caption=get_message(user_lang, "attribution"),
         )
+        if audio_cache_key:
+            asyncio.create_task(_persist_media_cache(audio_cache_key, sent))
         delivered = True
     except CookieExpiredError as exc:
         logging.error("cookie_expired (audio): %s", exc)
@@ -776,7 +957,8 @@ async def download_callback(callback: CallbackQuery) -> None:
     try:
         height = int(quality)
     except ValueError:
-        await callback.answer()
+        # callback.answer() was already called above — calling it again raises
+        # TelegramBadRequest. Just bail.
         return
 
     content_type = detect_content_type(url)
@@ -954,6 +1136,11 @@ async def url_handler(message: Message) -> None:
     if not _is_url_text(text):
         if message.chat.type == "private" and len(text) >= 2:
             await _handle_music_search(message, text, lang)
+            # Count toward daily quota — each search is a real yt-dlp call.
+            if message.from_user:
+                asyncio.create_task(db.log_request(
+                    message.from_user.id, "search", success=True,
+                ))
         return
 
     url = text
@@ -977,10 +1164,14 @@ async def url_handler(message: Message) -> None:
 
     try:
         if is_instagram_video:
-            # IG video: instaloader returns auth-scoped URLs and yt-dlp HLS works fine
-            # at download-time. Skip the CDN extraction and just grab metadata.
-            meta = await fetch_instagram_meta(url)
-            cdn_items: list[tuple[str, str]] = []
+            # Stories aren't covered by extract_info_full's instaloader path
+            # (only post/reel), so just grab metadata. Reels go through the
+            # full path below to get CDN items at picker-time too.
+            if content_type == "story":
+                meta = await fetch_instagram_meta(url)
+                cdn_items: list[tuple[str, str]] = []
+            else:
+                meta, cdn_items = await extract_info_full(url)
         else:
             meta, cdn_items = await extract_info_full(url)
 
@@ -1155,7 +1346,7 @@ async def _deliver_recognized_song(
 
         thumb_input = None
         thumbnail_url = (info.get("thumbnail") or "") if info else ""
-        if thumbnail_url:
+        if thumbnail_url and _is_safe_public_url(thumbnail_url):
             try:
                 import aiohttp
                 async with aiohttp.ClientSession() as session:
@@ -1324,7 +1515,8 @@ async def _healthcheck_loop(stop_event: asyncio.Event) -> None:
 
 
 async def _rate_store_sweep_loop(stop_event: asyncio.Event) -> None:
-    """Drop expired entries from _rate_store every 5 minutes — caps memory."""
+    """Drop expired entries from _rate_store and purge stale temp/ every 5 minutes."""
+    purge_counter = 0
     while True:
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=300.0)
@@ -1340,6 +1532,27 @@ async def _rate_store_sweep_loop(stop_event: asyncio.Event) -> None:
                 _rate_store[k] = kept
             else:
                 _rate_store.pop(k, None)
+        # Drop expired pending cookie-upload windows so admin entries don't pile up.
+        for uid, deadline in list(_pending_cookie_uploads.items()):
+            if deadline < now:
+                _pending_cookie_uploads.pop(uid, None)
+        # Once an hour (every 12th sweep), purge stale temp dirs so any leaked
+        # UUID dirs from failed cleanup paths don't accumulate over a long deploy.
+        # Once a day (every 288th sweep), evict expired/over-cap media_cache rows.
+        purge_counter += 1
+        if purge_counter % 12 == 0:
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, _purge_stale_temp, 3600)
+            except Exception:
+                logging.exception("rate_store_sweep: temp purge failed")
+        if purge_counter >= 288:
+            purge_counter = 0
+            try:
+                deleted = await db.media_cache_evict(max_rows=100_000, ttl_days=30)
+                if deleted:
+                    logging.info("media_cache_evict: removed %d stale rows", deleted)
+            except Exception:
+                logging.exception("rate_store_sweep: media_cache_evict failed")
 
 
 async def main() -> None:
@@ -1435,10 +1648,11 @@ async def main() -> None:
     polling_task = asyncio.create_task(
         dp.start_polling(bot, handle_signals=False)
     )
+    stop_waiter_task = asyncio.create_task(stop_event.wait())
 
     # Wait for either: the polling task to exit, or a shutdown signal.
     done, _pending = await asyncio.wait(
-        {polling_task, asyncio.create_task(stop_event.wait())},
+        {polling_task, stop_waiter_task},
         return_when=asyncio.FIRST_COMPLETED,
     )
 
@@ -1448,10 +1662,14 @@ async def main() -> None:
     except Exception:
         logging.exception("dp.stop_polling failed")
 
-    for t in (polling_task, health_task, sweep_task):
+    # Include stop_waiter_task so it doesn't leak when polling exits first.
+    for t in (polling_task, health_task, sweep_task, stop_waiter_task):
         if not t.done():
             t.cancel()
-    await asyncio.gather(polling_task, health_task, sweep_task, return_exceptions=True)
+    await asyncio.gather(
+        polling_task, health_task, sweep_task, stop_waiter_task,
+        return_exceptions=True,
+    )
 
     try:
         await bot.session.close()

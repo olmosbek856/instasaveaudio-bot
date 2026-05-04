@@ -432,15 +432,18 @@ async def test_download_media_passes_height_to_format(tmp_path):
             downloader.TEMP_DIR = original_temp
 
 
-# --- _cookiefile_for: cookies must be passed to YouTube too (datacenter IPs need them) ---
+# --- _cookiefile_for: YouTube must NOT receive cookies (skips android/ios clients) ---
 
-def test_cookiefile_for_returns_path_for_youtube(tmp_path, monkeypatch):
+def test_cookiefile_for_returns_none_for_youtube(tmp_path, monkeypatch):
     import downloader
     f = tmp_path / "cookies.txt"
     f.write_text("# Netscape HTTP Cookie File\n" + "x" * 100)
     monkeypatch.setattr(downloader, "_COOKIES_FILE", str(f))
-    assert downloader._cookiefile_for("https://www.youtube.com/watch?v=x") == str(f)
-    assert downloader._cookiefile_for("https://youtu.be/abc") == str(f)
+    # As of 2026.05, passing cookies to YouTube causes yt-dlp to skip the
+    # android/ios player clients — the only ones returning playable formats
+    # without a PO token or JS-runtime sig solving.
+    assert downloader._cookiefile_for("https://www.youtube.com/watch?v=x") is None
+    assert downloader._cookiefile_for("https://youtu.be/abc") is None
 
 
 def test_cookiefile_for_still_returns_path_for_instagram(tmp_path, monkeypatch):

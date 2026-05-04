@@ -1,18 +1,60 @@
 import html as _html_lib
 import http.cookiejar
+import ipaddress
 import logging
 import os
 import re
+import socket
 import time
 import uuid
 import asyncio
 import shutil
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 import yt_dlp
 
 from config import TEMP_DIR
+
+
+def _is_safe_public_url(url: str) -> bool:
+    """Reject URLs whose host resolves to a private/loopback/link-local IP.
+
+    Defends _fetch_html and _stream_cdn_to_file against SSRF: a hostile
+    Threads-shaped page (or any extractor output we don't fully trust) could
+    feed us 169.254.169.254, 127.0.0.1, 10.x, etc. We resolve before fetch
+    and bail if any A/AAAA points somewhere internal. http(s) only.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https"):
+        return False
+    host = parts.hostname
+    if not host:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError):
+        return False
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            return False
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            return False
+    return True
 
 
 class _SilentLogger:
@@ -80,15 +122,20 @@ def _cookiefile_for(url: str) -> str | None:
     except OSError:
         return None
     url_l = url.lower()
-    if "instagram.com" in url_l or "youtube.com" in url_l or "youtu.be" in url_l:
+    # YouTube intentionally excluded as of 2026.05: cookies cause yt-dlp to
+    # *skip* the android/ios clients (the only ones still returning playable
+    # formats without a PO token or JS-runtime sig solving). Passing cookies
+    # to a YT extraction now reliably yields "only images available."
+    if "instagram.com" in url_l:
         return _COOKIES_FILE
     return None
 
-# Late-2025 / 2026 working set:
-#   tv_simply — TV web client, DRM-free (replacement for `tv` after yt-dlp #12563)
-#   mweb      — mobile web, lightweight, no PO-token gate
-#   web       — last-resort fallback; benefits from cookies.txt when present
-_YT_PLAYER_CLIENTS = ["tv_simply", "mweb", "web"]
+# Mid-2026 working set, ordered by reliability:
+#   android, ios — return format 18 (360p muxed mp4) without PO token or
+#                  sig solving. Skipped silently if cookies are passed.
+#   tv_simply    — TV web client; needs PO token for HD streams.
+#   mweb, web    — last-resort; need PO token + JS sig solving.
+_YT_PLAYER_CLIENTS = ["android", "ios", "tv_simply", "mweb", "web"]
 
 
 def _base_opts() -> dict:
@@ -189,13 +236,25 @@ def _get_instaloader():
 
 def _reload_instaloader_cookies() -> None:
     """Drop the singleton so the next caller rebuilds it with a fresh cookie jar.
+    Also clears the auth-cooldown so the next request retries instaloader.
 
     Called after the admin uploads a new cookies.txt via /upload_cookies. In-flight
     requests finish with the old session; the next request pays one constructor
     cost (~50ms). Attribute writes are atomic in CPython, so no lock is needed.
     """
-    global _instaloader_instance
+    global _instaloader_instance, _instaloader_cooldown_until
     _instaloader_instance = None
+    _instaloader_cooldown_until = 0.0
+
+
+# Auth-failure cooldown: when instaloader's GraphQL endpoint returns 401/403,
+# we skip the fast-path for the next 30 minutes and go straight to yt-dlp.
+# Saves the ~2-4s wasted on a doomed instaloader call when Instagram is blocking
+# the bot's cookies at the GraphQL level (yt-dlp uses different endpoints that
+# are more reliable). Cleared by _reload_instaloader_cookies() so a fresh
+# upload retries immediately.
+_instaloader_cooldown_until: float = 0.0
+_INSTALOADER_COOLDOWN_SEC = 1800.0  # 30 minutes
 
 
 # ── Concurrency limiters ────────────────────────────────────────────────────
@@ -237,6 +296,73 @@ _RESULT_CACHE_MAX = 2000  # evict oldest when full
 # first extraction finishes, the second awaits the first's future instead of
 # spawning a parallel yt-dlp run. Catches viral links and double-clicks.
 _inflight: dict[tuple[str, int | None], asyncio.Future] = {}
+
+
+# ── Content cache key canonicalizer ─────────────────────────────────────────
+
+_YT_VIDEO_ID_RE = re.compile(
+    r"(?:youtube\.com/(?:watch\?(?:[^#]*&)?v=|shorts/|embed/|v/)|youtu\.be/)"
+    r"([A-Za-z0-9_-]{11})",
+    re.IGNORECASE,
+)
+_TIKTOK_VIDEO_ID_RE = re.compile(
+    r"tiktok\.com/(?:@[\w.-]+/)?(?:video|photo)/(\d+)",
+    re.IGNORECASE,
+)
+_IG_STORY_ID_RE = re.compile(
+    r"instagram\.com/stories/[\w.-]+/(\d+)",
+    re.IGNORECASE,
+)
+_THREADS_POST_ID_RE = re.compile(
+    r"threads\.(?:net|com)/@?[\w.-]+/post/([A-Za-z0-9_-]+)",
+    re.IGNORECASE,
+)
+_PINTEREST_PIN_ID_RE = re.compile(
+    r"(?:pinterest\.[a-z.]+/pin/(\d+)|pin\.it/([A-Za-z0-9]+))",
+    re.IGNORECASE,
+)
+
+
+def content_cache_key(url: str, kind: str, quality: int | str | None = None) -> str | None:
+    """Stable cache key for the media_cache table.
+
+    Returns None for URLs we can't normalize confidently — callers must skip
+    caching in that case rather than risk collisions.
+
+    kind:    'video' | 'audio' | 'photo'
+    quality: video height (480/720/1080/2160) | 'audio' | None for photo
+    """
+    if not url:
+        return None
+    q = str(quality) if quality is not None else "default"
+
+    m = _YT_VIDEO_ID_RE.search(url)
+    if m:
+        return f"yt:{m.group(1)}:{kind}:{q}"
+
+    m = _IG_STORY_ID_RE.search(url)
+    if m:
+        return f"ig:story:{m.group(1)}:{kind}:{q}"
+
+    m = _SHORTCODE_PATTERN.search(url)
+    if m and "instagram.com" in url.lower():
+        return f"ig:{m.group(2)}:{kind}:{q}"
+
+    m = _TIKTOK_VIDEO_ID_RE.search(url)
+    if m:
+        return f"tt:{m.group(1)}:{kind}:{q}"
+
+    m = _THREADS_POST_ID_RE.search(url)
+    if m:
+        return f"th:{m.group(1)}:{kind}:{q}"
+
+    m = _PINTEREST_PIN_ID_RE.search(url)
+    if m:
+        pin_id = m.group(1) or m.group(2)
+        return f"pn:{pin_id}:{kind}:{q}"
+
+    # Unrecognised URL shape — don't cache (would collide across users).
+    return None
 
 
 def is_supported_url(url: str) -> bool:
@@ -351,11 +477,16 @@ async def extract_info_full(url: str, height: int | None = None) -> tuple[dict, 
                 fut.set_result((meta, cdn))
             return meta, cdn
     finally:
+        # If our task was cancelled before resolving the future, propagate the
+        # cancellation to piggyback awaiters instead of leaking them forever.
+        if not fut.done():
+            fut.cancel()
         _inflight.pop(cache_key, None)
 
 
 async def _do_extract_info(url: str, height: int | None = None) -> tuple[dict, list[tuple[str, str]]]:
     """Inner extraction — no cache, no semaphore."""
+    global _instaloader_cooldown_until
     content_type = detect_content_type(url)
     loop = asyncio.get_running_loop()
 
@@ -367,13 +498,18 @@ async def _do_extract_info(url: str, height: int | None = None) -> tuple[dict, l
             return meta, cdn
         # fall through to yt-dlp as a last-resort attempt
 
-    # Fast path: instaloader for Instagram posts AND reels (~2-4s vs yt-dlp ~8-12s).
-    # Skipped when the user requested a specific height — instaloader returns whatever
-    # IG provides, so respecting `height` requires the yt-dlp path.
+    # Fast path: instaloader for Instagram posts AND reels (~0.5-1s vs yt-dlp ~3-5s).
+    # We return the instaloader CDN URLs unconditionally and let _send_video_content
+    # try `answer_video(video=cdn_url)` — Telegram fetches directly from FBCDN. If
+    # Telegram rejects the URL (e.g., signing issues), the existing TelegramBadRequest
+    # fallback downloads via aiohttp. Either way we skip the slow yt-dlp pipeline.
+    # Note: instaloader returns whatever quality IG provides (usually 720p-1080p),
+    # so user-requested `height` is ignored on this path. IG itself rarely exposes
+    # multiple quality variants, so this is acceptable.
     if (
-        height is None
-        and content_type in ("post", "reel")
+        content_type in ("post", "reel")
         and "instagram.com" in url
+        and time.monotonic() >= _instaloader_cooldown_until  # skip during cooldown
     ):
         m = _SHORTCODE_PATTERN.search(url)
         if m:
@@ -381,20 +517,25 @@ async def _do_extract_info(url: str, height: int | None = None) -> tuple[dict, l
             try:
                 future = loop.run_in_executor(None, _instaloader_fetch, shortcode)
                 meta, cdn_items = await asyncio.wait_for(future, timeout=4.0)
-                # Only use instaloader CDN for image-only posts — Telegram can access image
-                # CDN URLs directly. For video URLs instaloader returns auth-scoped links
-                # that Telegram's servers cannot fetch; yt-dlp returns publicly signed URLs.
-                if cdn_items and all(e in ("jpg", "jpeg", "png", "webp") for _, e in cdn_items):
+                if cdn_items:
                     return meta, cdn_items
             except asyncio.TimeoutError:
                 pass  # exceeded 4s budget — fall through to yt-dlp
             except Exception as e:
-                # Auth failure (login required / 401 / checkpoint) — bail to a typed
-                # error so the caller can show "cookies expired" instead of "error".
+                # instaloader is the FAST path; its failure must NOT short-circuit
+                # the extraction. yt-dlp uses different player clients (android/ios)
+                # that often work even when instaloader's GraphQL endpoint returns
+                # 401/403. Log auth failures for diagnostics, then fall through.
+                # yt-dlp will raise its own CookieExpiredError if it also fails.
                 if _looks_like_ig_auth_failure(e):
-                    raise CookieExpiredError(f"instaloader: {e}") from e
-                # Anything else (transient network, parser hiccup) → fall through
-                # to yt-dlp which has its own retries.
+                    _instaloader_cooldown_until = time.monotonic() + _INSTALOADER_COOLDOWN_SEC
+                    logging.warning(
+                        "instaloader auth failure — skipping fast path for next %.0f min "
+                        "(yt-dlp will handle requests). Upload fresh cookies via "
+                        "/upload_cookies to retry sooner. Detail: %s",
+                        _INSTALOADER_COOLDOWN_SEC / 60,
+                        str(e)[:200],
+                    )
 
     fmt = _format_for(content_type, height, url)
     ydl_opts = {**_base_opts(), **_extra_opts_for(url), "format": fmt}
@@ -596,7 +737,15 @@ async def search_and_download_audio(query: str) -> tuple[str, dict] | None:
 
 
 async def download_audio(url: str) -> str:
-    """Download audio-only (mp3) from URL. Returns temp file path."""
+    """Download audio-only from URL. Returns temp file path.
+
+    Skips the FFmpeg MP3 reencode by extracting audio with `preferredcodec=best`
+    (stream-copy, no transcode). Saves ~5-15s on a typical 4-minute track.
+    Falls back to `best` (muxed mp4 with audio) when no audio-only stream exists
+    — required for YouTube via the android/ios clients (no PO token), which
+    expose only format 18. Telegram's answer_audio plays m4a/AAC with full
+    title/performer metadata, so the MP3 codec is not required.
+    """
     async with _get_download_sem():
         output_dir = os.path.join(TEMP_DIR, str(uuid.uuid4()))
         os.makedirs(output_dir, exist_ok=True)
@@ -608,12 +757,18 @@ async def download_audio(url: str) -> str:
             **_base_opts(),
             **_extra_opts_for(url),
             "logger": capture_logger,
-            "format": "bestaudio/best",
+            # bestaudio[m4a] — direct fast path (most platforms).
+            # bestaudio    — generic audio-only fallback.
+            # best         — muxed video+audio (YouTube format 18). Postprocessor
+            #                strips audio losslessly when this branch hits.
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
             "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
+            # preferredcodec=best → ffmpeg `-c:a copy` (stream copy, no transcode).
+            # When source is muxed video, this demuxes audio out fast (~1-2s).
+            # When source is already audio-only, it's effectively a no-op remux.
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
+                "preferredcodec": "best",
             }],
             "playlist_items": "1",
             "concurrent_fragment_downloads": 10,
@@ -642,10 +797,7 @@ async def download_audio(url: str) -> str:
             shutil.rmtree(output_dir, ignore_errors=True)
             raise TimeoutError(f"yt-dlp audio download timed out for {url}") from e
 
-        mp3_files = list(Path(output_dir).glob("*.mp3"))
-        all_files = list(Path(output_dir).iterdir())
-        files = mp3_files if mp3_files else all_files
-
+        files = list(Path(output_dir).iterdir())
         if not files:
             detail = capture_logger.last_error or "no formats / unknown reason"
             raise FileNotFoundError(f"yt-dlp produced no audio — {detail[:200]}")
@@ -721,6 +873,9 @@ _THREADS_USER_AGENTS = (
 async def _fetch_html(url: str, user_agent: str, timeout_sec: float = 10.0) -> str:
     """Fetch URL HTML with a specific User-Agent. Returns "" on any failure."""
     import aiohttp
+    if not _is_safe_public_url(url):
+        logging.warning("Threads scrape: refusing non-public URL %s", url[:120])
+        return ""
     headers = {
         "User-Agent": user_agent,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -730,6 +885,11 @@ async def _fetch_html(url: str, user_agent: str, timeout_sec: float = 10.0) -> s
     try:
         async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
             async with session.get(url, allow_redirects=True) as resp:
+                # Recheck the post-redirect host so a 30x to 169.254/127/10.x is rejected.
+                final_url = getattr(resp, "url", None)
+                if final_url is not None and not _is_safe_public_url(str(final_url)):
+                    logging.warning("Threads scrape: redirect landed on non-public host %s", str(final_url)[:120])
+                    return ""
                 if resp.status != 200:
                     logging.info("Threads scrape: UA=%r → HTTP %d", user_agent[:30], resp.status)
                     return ""
@@ -866,6 +1026,8 @@ async def search_music(query: str, limit: int = 10) -> list[dict]:
 async def _stream_cdn_to_file(cdn_url: str, ext: str) -> str:
     """Download a CDN URL to disk via aiohttp. No semaphore — caller manages concurrency."""
     import aiohttp
+    if not _is_safe_public_url(cdn_url):
+        raise RuntimeError(f"refusing non-public CDN URL: {cdn_url[:120]}")
     output_dir = os.path.join(TEMP_DIR, str(uuid.uuid4()))
     os.makedirs(output_dir, exist_ok=True)
     file_path = os.path.join(output_dir, f"media.{ext or 'mp4'}")
@@ -879,6 +1041,9 @@ async def _stream_cdn_to_file(cdn_url: str, ext: str) -> str:
     timeout = aiohttp.ClientTimeout(total=120)
     async with aiohttp.ClientSession(headers=headers) as session:
         async with session.get(cdn_url, timeout=timeout) as resp:
+            final_url = getattr(resp, "url", None)
+            if final_url is not None and not _is_safe_public_url(str(final_url)):
+                raise RuntimeError(f"CDN download redirect landed on non-public host: {str(final_url)[:120]}")
             if resp.status != 200:
                 raise RuntimeError(f"CDN download failed: HTTP {resp.status}")
             with open(file_path, "wb") as f:
