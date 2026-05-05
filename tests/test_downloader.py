@@ -438,28 +438,68 @@ def test_cookiefile_for_returns_path_for_youtube(tmp_path, monkeypatch):
     import downloader
     f = tmp_path / "cookies.txt"
     f.write_text("# Netscape HTTP Cookie File\n" + "x" * 100)
+    rw = tmp_path / "cookies-rw.txt"
     monkeypatch.setattr(downloader, "_COOKIES_FILE", str(f))
+    monkeypatch.setattr(downloader, "_COOKIES_RW_FILE", str(rw))
+    monkeypatch.setattr(downloader, "_cookies_rw_src_mtime", None)
     # Datacenter IPs (DigitalOcean, Railway, etc.) get blocked by YouTube
     # without cookies ("Sign in to confirm you're not a bot"). Cookies are
-    # required for hosted deploys.
-    assert downloader._cookiefile_for("https://www.youtube.com/watch?v=x") == str(f)
-    assert downloader._cookiefile_for("https://youtu.be/abc") == str(f)
+    # required for hosted deploys. yt-dlp tries to save cookies on exit so we
+    # hand it a writable copy, not the read-only source.
+    assert downloader._cookiefile_for("https://www.youtube.com/watch?v=x") == str(rw)
+    assert downloader._cookiefile_for("https://youtu.be/abc") == str(rw)
+    assert rw.read_text() == f.read_text()
 
 
 def test_cookiefile_for_still_returns_path_for_instagram(tmp_path, monkeypatch):
     import downloader
     f = tmp_path / "cookies.txt"
     f.write_text("# Netscape HTTP Cookie File\n" + "x" * 100)
+    rw = tmp_path / "cookies-rw.txt"
     monkeypatch.setattr(downloader, "_COOKIES_FILE", str(f))
-    assert downloader._cookiefile_for("https://www.instagram.com/reel/ABC/") == str(f)
+    monkeypatch.setattr(downloader, "_COOKIES_RW_FILE", str(rw))
+    monkeypatch.setattr(downloader, "_cookies_rw_src_mtime", None)
+    assert downloader._cookiefile_for("https://www.instagram.com/reel/ABC/") == str(rw)
 
 
 def test_cookiefile_for_returns_none_for_unrelated_url(tmp_path, monkeypatch):
     import downloader
     f = tmp_path / "cookies.txt"
     f.write_text("# Netscape HTTP Cookie File\n" + "x" * 100)
+    rw = tmp_path / "cookies-rw.txt"
     monkeypatch.setattr(downloader, "_COOKIES_FILE", str(f))
+    monkeypatch.setattr(downloader, "_COOKIES_RW_FILE", str(rw))
+    monkeypatch.setattr(downloader, "_cookies_rw_src_mtime", None)
     assert downloader._cookiefile_for("https://google.com") is None
+
+
+def test_cookiefile_for_refreshes_writable_copy_when_source_changes(tmp_path, monkeypatch):
+    import downloader, time as _t
+    f = tmp_path / "cookies.txt"
+    rw = tmp_path / "cookies-rw.txt"
+    f.write_text("# Netscape HTTP Cookie File\n" + "v1" * 50)
+    monkeypatch.setattr(downloader, "_COOKIES_FILE", str(f))
+    monkeypatch.setattr(downloader, "_COOKIES_RW_FILE", str(rw))
+    monkeypatch.setattr(downloader, "_cookies_rw_src_mtime", None)
+    downloader._cookiefile_for("https://www.youtube.com/watch?v=x")
+    assert "v1" in rw.read_text()
+    # Simulate an admin uploading fresh cookies (changes source mtime).
+    _t.sleep(0.01)
+    f.write_text("# Netscape HTTP Cookie File\n" + "v2" * 50)
+    os.utime(str(f), None)
+    downloader._cookiefile_for("https://www.youtube.com/watch?v=x")
+    assert "v2" in rw.read_text()
+
+
+def test_cookiefile_for_returns_none_when_source_too_small(tmp_path, monkeypatch):
+    import downloader
+    f = tmp_path / "cookies.txt"
+    f.write_text("tiny")
+    rw = tmp_path / "cookies-rw.txt"
+    monkeypatch.setattr(downloader, "_COOKIES_FILE", str(f))
+    monkeypatch.setattr(downloader, "_COOKIES_RW_FILE", str(rw))
+    monkeypatch.setattr(downloader, "_cookies_rw_src_mtime", None)
+    assert downloader._cookiefile_for("https://www.youtube.com/watch?v=x") is None
 
 
 def test_reload_instaloader_cookies_drops_singleton(monkeypatch):

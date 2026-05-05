@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import socket
+import tempfile
 import time
 import uuid
 import asyncio
@@ -74,6 +75,41 @@ class _SilentLogger:
 
 _COOKIES_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
 
+# yt-dlp's YoutubeDL.__exit__ unconditionally calls cookiejar.save() back to
+# whatever path was passed as `cookiefile`. In Docker deploys the source
+# cookies.txt is typically a read-only bind mount, so handing the source path
+# directly to yt-dlp produces `OSError: [Errno 30] Read-only file system` on
+# every extraction. We instead copy the source to a writable temp file and
+# point yt-dlp at the copy. The copy is rebuilt whenever the source mtime
+# changes (e.g. after /upload_cookies).
+_COOKIES_RW_FILE = os.path.join(tempfile.gettempdir(), "instasave-cookies.txt")
+_cookies_rw_src_mtime: float | None = None
+
+
+def _ensure_cookies_writable() -> str | None:
+    """Sync the source cookies file to a writable temp copy, return the copy path."""
+    global _cookies_rw_src_mtime
+    if not os.path.isfile(_COOKIES_FILE):
+        return None
+    try:
+        src_mtime = os.path.getmtime(_COOKIES_FILE)
+        src_size = os.path.getsize(_COOKIES_FILE)
+    except OSError:
+        return None
+    if src_size < 50:
+        return None
+    if (
+        _cookies_rw_src_mtime != src_mtime
+        or not os.path.isfile(_COOKIES_RW_FILE)
+    ):
+        try:
+            shutil.copy2(_COOKIES_FILE, _COOKIES_RW_FILE)
+            os.chmod(_COOKIES_RW_FILE, 0o644)
+        except OSError:
+            return None
+        _cookies_rw_src_mtime = src_mtime
+    return _COOKIES_RW_FILE
+
 
 class CookieExpiredError(Exception):
     """Instagram cookies are expired/invalid — extraction cannot proceed until rotated."""
@@ -107,31 +143,16 @@ def _looks_like_ig_auth_failure(exc: BaseException) -> bool:
 
 
 def _cookiefile_for(url: str) -> str | None:
-    """Return cookies.txt path if usable for this URL, else None.
+    """Return a writable cookies.txt path if usable for this URL, else None.
 
     Instagram and YouTube both reject many anonymous requests from datacenter
     IPs — passing cookies to yt-dlp is the difference between a 401/403 and a
     successful extraction. yt-dlp ignores domain-mismatched cookies silently,
     so a jar containing only Instagram cookies is safe to pass for YouTube.
     """
-    if not os.path.isfile(_COOKIES_FILE):
-        return None
-    try:
-        if os.path.getsize(_COOKIES_FILE) < 50:
-            return None
-    except OSError:
-        return None
     url_l = url.lower()
-    # On datacenter IPs (e.g. DigitalOcean Droplets), YouTube returns
-    # "Sign in to confirm you're not a bot" without cookies. So we DO pass
-    # cookies for YouTube on hosted deploys. Note: yt-dlp auto-skips
-    # android/ios clients when cookies are present, so we rely on
-    # tv_simply/mweb/web from _YT_PLAYER_CLIENTS — those work with cookies
-    # because the session implicitly provides what would otherwise need a
-    # PO token. On residential IPs (no DC-IP blocking) the cookies-free
-    # android client is still preferred, but that's not the deploy target.
     if "instagram.com" in url_l or "youtube.com" in url_l or "youtu.be" in url_l:
-        return _COOKIES_FILE
+        return _ensure_cookies_writable()
     return None
 
 # Mid-2026 working set, ordered by reliability:
@@ -246,9 +267,11 @@ def _reload_instaloader_cookies() -> None:
     requests finish with the old session; the next request pays one constructor
     cost (~50ms). Attribute writes are atomic in CPython, so no lock is needed.
     """
-    global _instaloader_instance, _instaloader_cooldown_until
+    global _instaloader_instance, _instaloader_cooldown_until, _cookies_rw_src_mtime
     _instaloader_instance = None
     _instaloader_cooldown_until = 0.0
+    # Force the writable cookies copy to refresh on next extract.
+    _cookies_rw_src_mtime = None
 
 
 # Auth-failure cooldown: when instaloader's GraphQL endpoint returns 401/403,
