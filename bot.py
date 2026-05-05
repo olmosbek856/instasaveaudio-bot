@@ -1,6 +1,5 @@
 import asyncio
 import html as _html
-import io
 import json
 import logging
 import os
@@ -186,12 +185,6 @@ _user_langs: dict[int, str] = _load_langs()
 # Keyed by error_kind → monotonic timestamp of last alert.
 _admin_alert_throttle: dict[str, float] = {}
 _ADMIN_ALERT_INTERVAL_SEC = 3600.0  # at most one DM per error_kind per hour
-
-# Pending /upload_cookies sessions: admin_id → monotonic deadline.
-# An admin runs /upload_cookies, then sends a cookies.txt document within the window.
-_pending_cookie_uploads: dict[int, float] = {}
-_COOKIE_UPLOAD_WINDOW_SEC = 300.0
-
 
 async def _check_user_allowed(user_id: int) -> tuple[bool, str | None]:
     """Returns (allowed, reason). reason ∈ {'banned', 'quota', None}.
@@ -582,122 +575,6 @@ async def stats_handler(message: Message) -> None:
             rate = f"{(ok / n * 100):.0f}%" if n else "—"
             lines.append(f"• <code>{_html.escape(platform)}</code> — {n} ({rate})")
     await message.answer("\n".join(lines))
-
-
-def _parse_netscape_cookies(data: bytes) -> list[str]:
-    """Return non-comment, non-blank lines from a Netscape cookies.txt blob.
-
-    Each line is `domain TAB include_subdomains TAB path TAB secure TAB
-    expires TAB name TAB value`. Comment/blank lines are dropped. Caller
-    can write back a fresh file with one canonical header.
-    """
-    lines: list[str] = []
-    for raw in data.decode("utf-8", errors="replace").splitlines():
-        line = raw.rstrip("\r\n")
-        if not line or line.lstrip().startswith("#"):
-            continue
-        if "\t" not in line:
-            continue
-        lines.append(line)
-    return lines
-
-
-def _merge_cookies(existing: bytes, new: bytes) -> bytes:
-    """Merge two Netscape cookies.txt blobs, keeping the latest entry per
-    (domain, name). The new blob wins on conflict. Returns the full file
-    bytes ready to write."""
-    by_key: dict[tuple[str, str], str] = {}
-    for line in _parse_netscape_cookies(existing) + _parse_netscape_cookies(new):
-        parts = line.split("\t")
-        if len(parts) < 7:
-            continue
-        domain, name = parts[0], parts[5]
-        by_key[(domain, name)] = line
-    out = ["# Netscape HTTP Cookie File", ""]
-    out.extend(sorted(by_key.values()))
-    out.append("")
-    return ("\n".join(out)).encode("utf-8")
-
-
-@dp.message(Command("upload_cookies"))
-async def upload_cookies_handler(message: Message) -> None:
-    """Admin-only: open a 5-minute window to receive cookies.txt documents.
-
-    The admin can upload multiple files (e.g. one for Instagram, one for
-    YouTube). Each upload is merged into cookies.txt — newer cookies win
-    on (domain, name) conflict. The window stays open across uploads.
-    """
-    if not message.from_user or message.from_user.id not in ADMIN_USER_IDS:
-        return
-    _pending_cookie_uploads[message.from_user.id] = time.monotonic() + _COOKIE_UPLOAD_WINDOW_SEC
-    extra = ""
-    if os.getenv("INSTAGRAM_COOKIES_TXT"):
-        extra = (
-            "\n\n⚠️ <code>INSTAGRAM_COOKIES_TXT</code> env var is set in Railway — "
-            "the next redeploy will overwrite this upload. Update the env var too "
-            "(or remove it) to make the change persist."
-        )
-    await message.answer(
-        "Send your Netscape <b>cookies.txt</b> file(s) as documents within 5 minutes. "
-        "You can send multiple (e.g. Instagram + YouTube) — they will be merged." + extra,
-    )
-
-
-@dp.message(F.document)
-async def cookies_document_handler(message: Message) -> None:
-    """Receive a cookies.txt upload from an admin who recently ran /upload_cookies."""
-    uid = message.from_user.id if message.from_user else 0
-    deadline = _pending_cookie_uploads.get(uid, 0.0)
-    if uid not in ADMIN_USER_IDS or time.monotonic() > deadline:
-        return  # silent fall-through for non-admin or no pending upload
-
-    try:
-        buf = io.BytesIO()
-        await message.bot.download(message.document, destination=buf)
-        data = buf.getvalue()
-    except Exception as exc:
-        logging.exception("upload_cookies: download failed")
-        await message.answer(f"Download failed: {exc}")
-        return
-
-    if len(data) < 50 or (
-        b"# Netscape HTTP Cookie File" not in data[:200] and b"\t" not in data
-    ):
-        await message.answer("Not a valid Netscape cookies.txt.")
-        return
-
-    cookies_path = downloader._COOKIES_FILE
-    existing = b""
-    if os.path.isfile(cookies_path):
-        try:
-            with open(cookies_path, "rb") as f:
-                existing = f.read()
-        except OSError:
-            existing = b""
-
-    merged = _merge_cookies(existing, data)
-    tmp_path = cookies_path + ".tmp"
-    try:
-        with open(tmp_path, "wb") as f:
-            f.write(merged)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, cookies_path)
-    except OSError as exc:
-        logging.exception("upload_cookies: write failed")
-        await message.answer(f"Write failed: {exc}")
-        return
-
-    downloader._reload_instaloader_cookies()
-    # Extend the window so the admin can keep uploading more files.
-    _pending_cookie_uploads[uid] = time.monotonic() + _COOKIE_UPLOAD_WINDOW_SEC
-
-    new_lines = len(_parse_netscape_cookies(data))
-    total_lines = len(_parse_netscape_cookies(merged))
-    await message.answer(
-        f"✅ Merged {new_lines} cookies (file now has {total_lines}, {len(merged)} bytes). "
-        "Send another file or wait for the window to close."
-    )
 
 
 @dp.callback_query(F.data.startswith("lang:"))
@@ -1532,10 +1409,6 @@ async def _rate_store_sweep_loop(stop_event: asyncio.Event) -> None:
                 _rate_store[k] = kept
             else:
                 _rate_store.pop(k, None)
-        # Drop expired pending cookie-upload windows so admin entries don't pile up.
-        for uid, deadline in list(_pending_cookie_uploads.items()):
-            if deadline < now:
-                _pending_cookie_uploads.pop(uid, None)
         # Once an hour (every 12th sweep), purge stale temp dirs so any leaked
         # UUID dirs from failed cleanup paths don't accumulate over a long deploy.
         # Once a day (every 288th sweep), evict expired/over-cap media_cache rows.

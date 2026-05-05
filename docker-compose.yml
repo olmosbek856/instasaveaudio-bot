@@ -7,7 +7,6 @@ services:
       - .env
     stop_grace_period: 30s
     volumes:
-      - ./cookies.txt:/app/cookies.txt:ro
       - ./data:/app/data
     logging:
       driver: json-file

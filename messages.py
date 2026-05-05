@@ -3,7 +3,6 @@ MESSAGES = {
         "start": (
             "🔥 Assalomu alaykum, <b>@instasaveaudio_bot</b> ga xush kelibsiz!\n\n"
             "📥 <b>Yuklab olish mumkin:</b>\n"
-            "• <b>Instagram</b> — post, reel, story\n"
             "• <b>YouTube</b> — videolar va shorts\n"
             "• <b>TikTok</b> — suv belgisiz video\n"
             "• <b>Snapchat</b> — Spotlight va story\n"
@@ -52,7 +51,6 @@ MESSAGES = {
         "help": (
             "<b>InstaSaveBot — Yordam</b>\n\n"
             "<b>Qo'llab-quvvatlanadigan platformalar:</b>\n"
-            "• Instagram (Reels, Posts, Stories)\n"
             "• YouTube va Shorts\n"
             "• TikTok (suv belgisiz)\n"
             "• Snapchat (Spotlight, story)\n"
@@ -71,7 +69,7 @@ MESSAGES = {
         "error": "😔 Yuklab bo'lmadi. Keyinroq urinib ko'ring.",
         "invalid_url": (
             "❌ Bu havola qo'llab-quvvatlanmaydi.\n\n"
-            "Instagram, YouTube, TikTok, Snapchat, Likee, Pinterest yoki Threads havolasini yuboring."
+            "YouTube, TikTok, Snapchat, Likee, Pinterest yoki Threads havolasini yuboring."
         ),
         "too_large": "😔 Fayl hajmi juda katta (50MB dan oshadi). Telegram cheklovi.",
         "audio_btn": "🎵 Audiosi",
@@ -81,8 +79,8 @@ MESSAGES = {
         "quota_exceeded": "⏳ Bugungi limit tugadi. Iltimos, ertaga qayta urinib ko'ring.",
         "quota_banned": "🚫 Hisobingiz cheklangan. Yordam uchun adminga murojaat qiling.",
         "cookies_expired": (
-            "⚠️ Instagram autentifikatsiyasi muddati tugagan — admin tez orada yangilaydi.\n"
-            "Boshqa platformalar (YouTube, TikTok, Snapchat, Likee, Pinterest, Threads) ishlamoqda."
+            "ℹ️ Instagram qo'llab-quvvatlanmaydi.\n"
+            "YouTube, TikTok, Snapchat, Likee, Pinterest va Threads ishlaydi."
         ),
         "attribution": "📥 @instasaveaudio_bot orqali yuklab olindi ❤️",
         "choose_format": "Yuklab olish formatlari ↓",
@@ -94,7 +92,6 @@ MESSAGES = {
         "start": (
             "🔥 Добро пожаловать в <b>@instasaveaudio_bot</b>!\n\n"
             "📥 <b>Можно скачать:</b>\n"
-            "• <b>Instagram</b> — посты, reels, stories\n"
             "• <b>YouTube</b> — видео и shorts\n"
             "• <b>TikTok</b> — без водяного знака\n"
             "• <b>Snapchat</b> — Spotlight и stories\n"
@@ -143,7 +140,6 @@ MESSAGES = {
         "help": (
             "<b>InstaSaveBot — Помощь</b>\n\n"
             "<b>Поддерживаемые платформы:</b>\n"
-            "• Instagram (Reels, Posts, Stories)\n"
             "• YouTube и Shorts\n"
             "• TikTok (без водяного знака)\n"
             "• Snapchat (Spotlight, stories)\n"
@@ -162,7 +158,7 @@ MESSAGES = {
         "error": "😔 Не удалось загрузить. Попробуйте позже.",
         "invalid_url": (
             "❌ Эта ссылка не поддерживается.\n\n"
-            "Отправьте ссылку из Instagram, YouTube, TikTok, Snapchat, Likee, Pinterest или Threads."
+            "Отправьте ссылку из YouTube, TikTok, Snapchat, Likee, Pinterest или Threads."
         ),
         "too_large": "😔 Файл слишком большой (больше 50MB). Ограничение Telegram.",
         "audio_btn": "🎵 Аудио",
@@ -172,8 +168,8 @@ MESSAGES = {
         "quota_exceeded": "⏳ Дневной лимит исчерпан. Попробуйте завтра.",
         "quota_banned": "🚫 Ваш аккаунт ограничен. Обратитесь к администратору.",
         "cookies_expired": (
-            "⚠️ Срок действия Instagram-авторизации истёк — администратор скоро обновит.\n"
-            "Другие платформы (YouTube, TikTok, Snapchat, Likee, Pinterest, Threads) работают."
+            "ℹ️ Instagram не поддерживается.\n"
+            "Работают YouTube, TikTok, Snapchat, Likee, Pinterest и Threads."
         ),
         "attribution": "📥 Скачано через @instasaveaudio_bot ❤️",
         "choose_format": "Форматы для скачивания ↓",
@@ -185,7 +181,6 @@ MESSAGES = {
         "start": (
             "🔥 Welcome to <b>@instasaveaudio_bot</b>!\n\n"
             "📥 <b>What you can download:</b>\n"
-            "• <b>Instagram</b> — posts, reels, stories\n"
             "• <b>YouTube</b> — videos and shorts\n"
             "• <b>TikTok</b> — watermark-free\n"
             "• <b>Snapchat</b> — Spotlight and stories\n"
@@ -234,7 +229,6 @@ MESSAGES = {
         "help": (
             "<b>InstaSaveBot — Help</b>\n\n"
             "<b>Supported platforms:</b>\n"
-            "• Instagram (Reels, Posts, Stories)\n"
             "• YouTube and Shorts\n"
             "• TikTok (watermark-free)\n"
             "• Snapchat (Spotlight, stories)\n"
@@ -253,7 +247,7 @@ MESSAGES = {
         "error": "😔 Download failed. Please try again later.",
         "invalid_url": (
             "❌ This link is not supported.\n\n"
-            "Send an Instagram, YouTube, TikTok, Snapchat, Likee, Pinterest, or Threads link."
+            "Send a YouTube, TikTok, Snapchat, Likee, Pinterest, or Threads link."
         ),
         "too_large": "😔 File is too large (over 50MB). Telegram limit.",
         "audio_btn": "🎵 Audio",
@@ -263,8 +257,8 @@ MESSAGES = {
         "quota_exceeded": "⏳ Daily limit reached. Please try again tomorrow.",
         "quota_banned": "🚫 Your account is restricted. Contact the admin for help.",
         "cookies_expired": (
-            "⚠️ Instagram authentication has expired — the admin will refresh it soon.\n"
-            "Other platforms (YouTube, TikTok, Snapchat, Likee, Pinterest, Threads) still work."
+            "ℹ️ Instagram is not supported.\n"
+            "YouTube, TikTok, Snapchat, Likee, Pinterest, and Threads work."
         ),
         "attribution": "📥 Downloaded via @instasaveaudio_bot ❤️",
         "choose_format": "Download formats ↓",
