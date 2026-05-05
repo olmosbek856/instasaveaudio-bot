@@ -403,6 +403,39 @@ async def test_download_media_returns_file_list(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_download_media_raises_cookie_expired_when_ig_without_cookies(tmp_path, monkeypatch):
+    """Without an IG cookie jar, every IG request is a guaranteed 401/403.
+    The user-facing path must short-circuit to CookieExpiredError so they see
+    "Instagram unavailable, other platforms work" instead of a generic error."""
+    import downloader
+    monkeypatch.setattr(downloader, "_COOKIES_FILE", str(tmp_path / "missing.txt"))
+    monkeypatch.setattr(downloader, "_COOKIES_RW_FILE", str(tmp_path / "missing-rw.txt"))
+    monkeypatch.setattr(downloader, "_cookies_rw_src_mtime", None)
+    with pytest.raises(downloader.CookieExpiredError):
+        await downloader.download_media("https://www.instagram.com/p/ABC/")
+
+
+@pytest.mark.asyncio
+async def test_download_audio_raises_cookie_expired_when_ig_without_cookies(tmp_path, monkeypatch):
+    import downloader
+    monkeypatch.setattr(downloader, "_COOKIES_FILE", str(tmp_path / "missing.txt"))
+    monkeypatch.setattr(downloader, "_COOKIES_RW_FILE", str(tmp_path / "missing-rw.txt"))
+    monkeypatch.setattr(downloader, "_cookies_rw_src_mtime", None)
+    with pytest.raises(downloader.CookieExpiredError):
+        await downloader.download_audio("https://www.instagram.com/reel/ABC/")
+
+
+@pytest.mark.asyncio
+async def test_extract_info_raises_cookie_expired_when_ig_without_cookies(tmp_path, monkeypatch):
+    import downloader
+    monkeypatch.setattr(downloader, "_COOKIES_FILE", str(tmp_path / "missing.txt"))
+    monkeypatch.setattr(downloader, "_COOKIES_RW_FILE", str(tmp_path / "missing-rw.txt"))
+    monkeypatch.setattr(downloader, "_cookies_rw_src_mtime", None)
+    with pytest.raises(downloader.CookieExpiredError):
+        await downloader._do_extract_info("https://www.instagram.com/p/ABC/")
+
+
+@pytest.mark.asyncio
 async def test_download_media_passes_height_to_format(tmp_path):
     """When height is specified, the format string must include the height filter."""
     fake_file = tmp_path / "000_video.mp4"

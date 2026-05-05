@@ -517,6 +517,14 @@ async def _do_extract_info(url: str, height: int | None = None) -> tuple[dict, l
     content_type = detect_content_type(url)
     loop = asyncio.get_running_loop()
 
+    # Instagram on a datacenter IP without cookies is a guaranteed failure
+    # (401/403 from both instaloader's GraphQL endpoint and yt-dlp's web
+    # extractor). Short-circuit with the cookie_expired path so the user sees
+    # the helpful "Instagram unavailable, other platforms work" message instead
+    # of a generic "download failed".
+    if "instagram.com" in url.lower() and _cookiefile_for(url) is None:
+        raise CookieExpiredError("instagram cookies absent; ig disabled")
+
     # Threads: yt-dlp covers only some video posts and almost no image posts.
     # The og: scraper handles both reliably for the common case (single media).
     if content_type == "threads":
@@ -665,6 +673,8 @@ async def extract_direct_urls(url: str, height: int | None = None) -> list[tuple
 
 async def download_media(url: str, height: int | None = None) -> list[str]:
     """Download all media from URL. Returns list of temp file paths."""
+    if "instagram.com" in url.lower() and _cookiefile_for(url) is None:
+        raise CookieExpiredError("instagram cookies absent; ig disabled")
     async with _get_download_sem():
         content_type = detect_content_type(url)
 
@@ -773,6 +783,8 @@ async def download_audio(url: str) -> str:
     expose only format 18. Telegram's answer_audio plays m4a/AAC with full
     title/performer metadata, so the MP3 codec is not required.
     """
+    if "instagram.com" in url.lower() and _cookiefile_for(url) is None:
+        raise CookieExpiredError("instagram cookies absent; ig disabled")
     async with _get_download_sem():
         output_dir = os.path.join(TEMP_DIR, str(uuid.uuid4()))
         os.makedirs(output_dir, exist_ok=True)
